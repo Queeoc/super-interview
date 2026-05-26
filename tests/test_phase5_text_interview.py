@@ -1,0 +1,607 @@
+"""Phase 5 文字面试主流程的最小验证。"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+import json
+from typing import Any
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+import pytest
+
+from app.agent.interview.executor import InterviewExecutor
+from app.agent.interview.planner import InterviewPlanner
+from app.agent.interview.prompts import InterviewPromptRunner
+from app.agent.interview.replanner import InterviewReplanner
+from app.api import interview as interview_api
+from app.core.database import get_db_session
+from app.middleware.error_handler import register_exception_handlers
+from app.models.interview import (
+    CreateInterviewRequest,
+    InterviewAnswerEntity,
+    InterviewReportEntity,
+    InterviewSessionEntity,
+    SubmitAnswerRequest,
+)
+from app.services.interview_persistence_service import InterviewPersistenceService
+from app.services.interview_service import InterviewService, InterviewSessionCache
+from app.services.skill_service import SkillService
+
+
+class _InMemoryRedisBackend:
+    """测试用 Redis 假对象。"""
+
+    def __init__(self) -> None:
+        self.enabled = True
+        self.storage: dict[str, str] = {}
+
+    async def get_value(self, key: str) -> str | None:
+        return self.storage.get(key)
+
+    async def set_value(self, key: str, value: str, ttl_seconds: int | None = None) -> bool:
+        self.storage[key] = value
+        return True
+
+    async def delete_key(self, key: str) -> int:
+        self.storage.pop(key, None)
+        return 1
+
+
+class _InMemoryInterviewRepository:
+    """测试用面试仓储，绕过真实数据库。"""
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, InterviewSessionEntity] = {}
+        self.answers: list[InterviewAnswerEntity] = []
+        self.reports: dict[str, InterviewReportEntity] = {}
+
+    async def add_session(self, entity: InterviewSessionEntity) -> InterviewSessionEntity:
+        if not entity.id:
+            entity.id = str(uuid4())
+        self.sessions[entity.id] = entity
+        return entity
+
+    async def upsert_session(self, entity: InterviewSessionEntity) -> InterviewSessionEntity:
+        if not entity.id:
+            entity.id = str(uuid4())
+        self.sessions[entity.id] = entity
+        return entity
+
+    async def get_session(self, session_id: str) -> InterviewSessionEntity | None:
+        return self.sessions.get(session_id)
+
+    async def add_answer(self, entity: InterviewAnswerEntity) -> InterviewAnswerEntity:
+        if not entity.id:
+            entity.id = str(uuid4())
+        self.answers.append(entity)
+        return entity
+
+    async def list_answers_by_session(self, session_id: str) -> list[InterviewAnswerEntity]:
+        return [answer for answer in self.answers if answer.session_id == session_id]
+
+    async def get_report_by_session(self, session_id: str) -> InterviewReportEntity | None:
+        return self.reports.get(session_id)
+
+    async def upsert_report(self, entity: InterviewReportEntity) -> InterviewReportEntity:
+        if not entity.id:
+            entity.id = str(uuid4())
+        self.reports[entity.session_id] = entity
+        return entity
+
+    async def get_session_snapshot(
+        self,
+        session_id: str,
+    ) -> tuple[
+        InterviewSessionEntity | None,
+        list[InterviewAnswerEntity],
+        InterviewReportEntity | None,
+    ]:
+        return (
+            self.sessions.get(session_id),
+            [answer for answer in self.answers if answer.session_id == session_id],
+            self.reports.get(session_id),
+        )
+
+
+def _build_test_service() -> tuple[InterviewService, _InMemoryInterviewRepository, AsyncMock, _InMemoryRedisBackend]:
+    """构建使用规则降级和内存仓储的面试服务。"""
+
+    repository = _InMemoryInterviewRepository()
+    redis_backend = _InMemoryRedisBackend()
+    prompt_runner = InterviewPromptRunner(enable_llm=False)
+    service = InterviewService(
+        skill_service=SkillService(),
+        persistence_service=InterviewPersistenceService(repository=repository),
+        repository_factory=lambda _session: repository,
+        prompt_runner=prompt_runner,
+        planner=InterviewPlanner(prompt_runner),
+        executor=InterviewExecutor(prompt_runner),
+        replanner=InterviewReplanner(prompt_runner),
+        cache=InterviewSessionCache(redis_backend=redis_backend),
+    )
+    session = AsyncMock()
+    return service, repository, session, redis_backend
+
+
+class _StructuredPromptSchema(BaseModel):
+    """用于验证 structured output 参数的测试 schema。"""
+
+    value: str
+
+
+class _FollowUpAliasSchema(BaseModel):
+    """用于验证追问别名兼容的测试 schema。"""
+
+    question_text: str
+
+
+class _ReplanAliasSchema(BaseModel):
+    """用于验证 replanner 附加字段兼容的测试 schema。"""
+
+    action: str
+    reason: str
+    next_question: str | None = None
+
+
+@pytest.mark.asyncio
+async def test_interview_prompt_runner_uses_json_schema_strict_mode() -> None:
+    """InterviewPromptRunner 应显式启用 provider-native json_schema 且 strict=True。"""
+
+    captured: dict[str, Any] = {}
+
+    class _StructuredInvoker:
+        async def ainvoke(self, prompt_text: str) -> dict[str, Any]:
+            captured["prompt_text"] = prompt_text
+            return {
+                "raw": None,
+                "parsed": _StructuredPromptSchema(value="ok"),
+                "parsing_error": None,
+            }
+
+    class _FakeLlm:
+        def with_structured_output(self, schema: type[BaseModel], **kwargs: Any) -> _StructuredInvoker:
+            captured["schema"] = schema
+            captured["kwargs"] = kwargs
+            return _StructuredInvoker()
+
+    runner = InterviewPromptRunner(
+        enable_llm=True,
+        llm_factory_fn=lambda **_: _FakeLlm(),
+    )
+
+    result = await runner.ainvoke_structured(
+        template_name="planner_system.st",
+        schema=_StructuredPromptSchema,
+        variables={
+            "skill_name": "Python Backend",
+            "skill_description": "desc",
+            "language": "zh-CN",
+            "max_rounds": 1,
+            "category_section": "- GENERAL | 通用问答 | NORMAL",
+            "skill_markdown": "<skill_markdown>skill</skill_markdown>",
+            "reference_markdown": "<reference_markdown>ref</reference_markdown>",
+        },
+    )
+
+    assert result.value == "ok"
+    assert captured["schema"] is _StructuredPromptSchema
+    assert captured["kwargs"]["method"] == "json_schema"
+    assert captured["kwargs"]["strict"] is True
+    assert captured["kwargs"]["include_raw"] is True
+    assert "Return only a JSON object." in captured["prompt_text"]
+
+
+@pytest.mark.asyncio
+async def test_interview_prompt_runner_rejects_invalid_structured_fields() -> None:
+    """错误字段名的 structured output 不应被当成有效结果。"""
+
+    class _StructuredInvoker:
+        async def ainvoke(self, prompt_text: str) -> dict[str, Any]:
+            return {
+                "raw": {"content": '{"category": "PROJECT", "question": "..." }'},
+                "parsed": None,
+                "parsing_error": ValueError("field mismatch"),
+            }
+
+    class _FakeLlm:
+        def with_structured_output(self, schema: type[BaseModel], **kwargs: Any) -> _StructuredInvoker:
+            return _StructuredInvoker()
+
+    runner = InterviewPromptRunner(
+        enable_llm=True,
+        llm_factory_fn=lambda **_: _FakeLlm(),
+    )
+
+    with pytest.raises(ValueError, match="structured output 解析失败"):
+        await runner.ainvoke_structured(
+            template_name="planner_system.st",
+            schema=_StructuredPromptSchema,
+            variables={
+                "skill_name": "Python Backend",
+                "skill_description": "desc",
+                "language": "zh-CN",
+                "max_rounds": 1,
+                "category_section": "- GENERAL | 通用问答 | NORMAL",
+                "skill_markdown": "<skill_markdown>skill</skill_markdown>",
+                "reference_markdown": "<reference_markdown>ref</reference_markdown>",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_planner_falls_back_when_provider_structured_output_fails() -> None:
+    """provider-native structured output 失败后，planner 应稳定回退到规则模板。"""
+
+    runner = InterviewPromptRunner(enable_llm=True)
+    runner.ainvoke_structured = AsyncMock(side_effect=ValueError("provider does not support json_schema"))  # type: ignore[method-assign]
+    planner = InterviewPlanner(runner)
+    skill_service = SkillService()
+    skill_detail = skill_service.get_skill_detail("python-backend")
+    reference_section = skill_service.build_reference_section("python-backend")
+
+    state = {
+        "session_id": "session-1",
+        "user_id": None,
+        "resume_id": None,
+        "title": "test",
+        "language": "zh-CN",
+        "max_rounds": 3,
+        "skill": {
+            "skill_id": skill_detail.skill_id,
+            "display_name": skill_detail.display_name,
+            "description": skill_detail.description,
+            "content_markdown": skill_detail.content_markdown,
+            "reference_markdown": reference_section.reference_markdown,
+            "categories": [category.model_dump(mode="json") for category in skill_detail.categories],
+            "reference_files": reference_section.resolved_reference_files,
+        },
+        "questions": [],
+        "current_question_key": None,
+        "current_round": 0,
+        "follow_up_count": 0,
+        "latest_answer_text": "",
+        "latest_answer_metadata": {},
+        "next_action": "initial_ask",
+        "action_reason": None,
+        "feedback": {},
+        "report_summary": {},
+        "completed": False,
+        "completion_message": None,
+        "assistant_message": None,
+        "last_draft_answer": {},
+        "answer_count": 0,
+    }
+
+    planned_state = await planner.run(state)
+
+    assert len(planned_state["questions"]) == 3
+    assert planned_state["questions"][0]["question_key"] == "q-1"
+    assert planned_state["questions"][0]["category_key"]
+    assert planned_state["questions"][0]["question_text"]
+
+
+@pytest.mark.asyncio
+async def test_executor_accepts_follow_up_question_alias() -> None:
+    """追问结构化输出应兼容 follow_up_question 别名。"""
+
+    runner = InterviewPromptRunner(enable_llm=True)
+    runner.ainvoke_structured = AsyncMock(
+        return_value=_FollowUpAliasSchema(question_text="请进一步说明你的缓存失效策略。")
+    )  # type: ignore[method-assign]
+    executor = InterviewExecutor(runner)
+
+    state = {
+        "session_id": "session-1",
+        "skill": {
+            "skill_id": "python-backend",
+            "display_name": "Python Backend",
+            "description": "desc",
+            "content_markdown": "skill",
+            "reference_markdown": "ref",
+            "categories": [],
+            "reference_files": [],
+        },
+        "questions": [
+            {
+                "question_key": "q-1",
+                "round_index": 1,
+                "category_key": "CACHE",
+                "question_text": "请介绍你的缓存设计经验。",
+                "parent_question_key": None,
+                "source": "planned",
+                "status": "asked",
+                "is_follow_up": False,
+                "asked_at": None,
+                "answered_at": None,
+            }
+        ],
+        "current_question_key": "q-1",
+        "current_round": 1,
+        "follow_up_count": 0,
+        "latest_answer_text": "我用过 Redis。",
+        "next_action": "follow_up",
+    }
+
+    follow_up_text = await executor._generate_follow_up_text(
+        skill=state["skill"],
+        current_question=state["questions"][0],
+        answer_text=state["latest_answer_text"],
+    )
+
+    assert follow_up_text == "请进一步说明你的缓存失效策略。"
+
+
+@pytest.mark.asyncio
+async def test_replanner_accepts_optional_next_question_payload() -> None:
+    """replanner 应兼容模型附带的 next_question 文本，而不触发回退。"""
+
+    runner = InterviewPromptRunner(enable_llm=True)
+    runner.ainvoke_structured = AsyncMock(  # type: ignore[method-assign]
+        return_value=_ReplanAliasSchema(
+            action="next_question",
+            reason="当前问题已经获得基本信息，可以进入下一题。",
+            next_question="能否分享更多关于缓存性能优化带来的收益？",
+        )
+    )
+    replanner = InterviewReplanner(runner)
+
+    state = {
+        "session_id": "session-1",
+        "skill": {
+            "skill_id": "python-backend",
+            "display_name": "Python Backend",
+            "description": "desc",
+            "content_markdown": "skill",
+            "reference_markdown": "ref",
+            "categories": [],
+            "reference_files": [],
+        },
+        "questions": [
+            {
+                "question_key": "q-1",
+                "round_index": 1,
+                "category_key": "CACHE",
+                "question_text": "请介绍你的缓存设计经验。",
+                "parent_question_key": None,
+                "source": "planned",
+                "status": "answered",
+                "is_follow_up": False,
+                "asked_at": None,
+                "answered_at": None,
+            },
+            {
+                "question_key": "q-2",
+                "round_index": 2,
+                "category_key": "DB",
+                "question_text": "请介绍你处理慢查询的经验。",
+                "parent_question_key": None,
+                "source": "planned",
+                "status": "planned",
+                "is_follow_up": False,
+                "asked_at": None,
+                "answered_at": None,
+            },
+        ],
+        "current_question_key": "q-1",
+        "current_round": 1,
+        "follow_up_count": 0,
+        "latest_answer_text": "我补充了缓存穿透和热点 key 处理。",
+        "max_rounds": 2,
+    }
+
+    next_state = await replanner.run(state)
+
+    assert next_state["next_action"] == "next_question"
+    assert "基本信息" in next_state["action_reason"]
+
+
+@pytest.mark.asyncio
+async def test_interview_service_creates_session_and_caches_initial_question() -> None:
+    """创建会话后应生成首题、持久化会话并写入缓存。"""
+
+    service, repository, session, redis_backend = _build_test_service()
+
+    result = await service.create_session(
+        session,
+        CreateInterviewRequest(skill_id="python-backend", max_rounds=3),
+    )
+
+    assert result.status == "active"
+    assert result.current_question is not None
+    assert result.current_question.question_key == "q-1"
+    assert len(result.questions) == 3
+    assert len(repository.sessions) == 1
+    assert len(redis_backend.storage) == 1
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_interview_service_short_answer_triggers_follow_up() -> None:
+    """短答案应触发追问分支。"""
+
+    service, repository, session, _ = _build_test_service()
+    created = await service.create_session(
+        session,
+        CreateInterviewRequest(skill_id="python-backend", max_rounds=2),
+    )
+
+    events = [
+        event
+        async for event in service.submit_answer_stream(
+            session,
+            created.session_id,
+            SubmitAnswerRequest(answer_text="会用 Redis。"),
+        )
+    ]
+
+    plan_event = next(event for event in events if event["type"] == "plan")
+    content_event = next(event for event in events if event["type"] == "content")
+    done_event = next(event for event in events if event["type"] == "done")
+
+    assert plan_event["action"] == "follow_up"
+    assert "追问" in content_event["content"] or "补充" in content_event["content"]
+    assert done_event["session"]["current_question"]["question_key"] == "q-1-f-1"
+    assert repository.answers[0].question_key == "q-1"
+
+
+@pytest.mark.asyncio
+async def test_interview_service_normal_answer_advances_to_next_question() -> None:
+    """正常答案应进入下一题。"""
+
+    service, _, session, _ = _build_test_service()
+    created = await service.create_session(
+        session,
+        CreateInterviewRequest(skill_id="python-backend", max_rounds=2),
+    )
+
+    answer_text = (
+        "我会先说明缓存目标，再结合热点数据、一致性要求和失效策略设计 Redis 方案，"
+        "同时补充持久化、监控告警和故障降级处理。"
+    )
+    events = [
+        event
+        async for event in service.submit_answer_stream(
+            session,
+            created.session_id,
+            SubmitAnswerRequest(answer_text=answer_text),
+        )
+    ]
+
+    plan_event = next(event for event in events if event["type"] == "plan")
+    done_event = next(event for event in events if event["type"] == "done")
+
+    assert plan_event["action"] == "next_question"
+    assert done_event["session"]["current_question"]["question_key"] == "q-2"
+    assert done_event["session"]["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_interview_service_last_round_completes_and_persists_report() -> None:
+    """达到最后一轮时应完成会话并生成占位报告。"""
+
+    service, repository, session, redis_backend = _build_test_service()
+    created = await service.create_session(
+        session,
+        CreateInterviewRequest(skill_id="python-backend", max_rounds=1),
+    )
+
+    answer_text = (
+        "我会从接口设计、数据库事务、一致性控制和回滚策略四个维度解释这个方案，"
+        "并结合一次线上故障的复盘说明最终如何验证发布结果。"
+    )
+    events = [
+        event
+        async for event in service.submit_answer_stream(
+            session,
+            created.session_id,
+            SubmitAnswerRequest(answer_text=answer_text),
+        )
+    ]
+
+    report_event = next(event for event in events if event["type"] == "report")
+    done_event = next(event for event in events if event["type"] == "done")
+
+    assert done_event["session"]["completed"] is True
+    assert done_event["session"]["status"] == "completed"
+    assert created.session_id in repository.reports
+    assert report_event["report"]["status"] == "pending"
+    assert redis_backend.storage == {}
+
+
+def _build_api_client(
+    monkeypatch: pytest.MonkeyPatch,
+    service: InterviewService,
+    session: AsyncMock,
+) -> TestClient:
+    """构建只挂载 interview 路由的测试客户端。"""
+
+    app = FastAPI()
+    register_exception_handlers(app)
+    monkeypatch.setattr(interview_api, "interview_service", service)
+
+    async def override_get_db_session() -> AsyncIterator[AsyncMock]:
+        yield session
+
+    app.dependency_overrides[get_db_session] = override_get_db_session
+    app.include_router(interview_api.router, prefix="/api")
+    return TestClient(app)
+
+
+def test_interview_api_supports_create_and_sse_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """API 应覆盖创建会话和 SSE 提交答案主路径。"""
+
+    service, _, session, _ = _build_test_service()
+    client = _build_api_client(monkeypatch, service, session)
+
+    create_response = client.post(
+        "/api/interview/sessions",
+        json={"skill_id": "python-backend", "max_rounds": 1},
+    )
+    assert create_response.status_code == 200
+    session_id = create_response.json()["data"]["session_id"]
+
+    with client.stream(
+        "POST",
+        f"/api/interview/sessions/{session_id}/answers",
+        json={
+            "answer_text": (
+                "我会先拆清楚问题边界，再结合现有链路说明存储、缓存、失败重试、监控指标与容量预估，"
+                "最后补充真实故障场景下的降级和回滚处理。"
+            )
+        },
+    ) as response:
+        assert response.status_code == 200
+        raw_lines = [line for line in response.iter_lines() if line]
+
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw_lines
+        if line.startswith("data: ")
+    ]
+    payload_types = [payload["type"] for payload in payloads]
+
+    assert "step_complete" in payload_types
+    assert "done" in payload_types
+    assert "report" in payload_types
+
+
+def test_interview_api_returns_domain_error_for_unknown_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """未知会话应返回面试域错误码。"""
+
+    service, _, session, _ = _build_test_service()
+    client = _build_api_client(monkeypatch, service, session)
+
+    response = client.get("/api/interview/sessions/not-found")
+
+    assert response.status_code == 404
+    assert response.json()["code"] == 3101
+
+
+def test_interview_api_rejects_blank_answer_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """空白答案应触发请求参数校验错误。"""
+
+    service, _, session, _ = _build_test_service()
+    client = _build_api_client(monkeypatch, service, session)
+    create_response = client.post(
+        "/api/interview/sessions",
+        json={"skill_id": "python-backend", "max_rounds": 1},
+    )
+    session_id = create_response.json()["data"]["session_id"]
+
+    response = client.post(
+        f"/api/interview/sessions/{session_id}/answers/draft",
+        json={"answer_text": "   "},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == 1001

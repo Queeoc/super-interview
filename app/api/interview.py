@@ -1,0 +1,130 @@
+"""文字面试主流程 API。"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sse_starlette.sse import EventSourceResponse
+
+from app.core.database import get_db_session
+from app.models.interview import CreateInterviewRequest, SubmitAnswerRequest
+from app.services.interview_service import interview_service
+from app.utils.exceptions import BusinessException, ErrorCode
+
+router = APIRouter()
+
+
+@router.post("/interview/sessions")
+async def create_interview_session(
+    request: CreateInterviewRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """创建文字面试会话并同步返回首题。"""
+
+    result = await interview_service.create_session(session, request)
+    return {
+        "code": 200,
+        "message": "success",
+        "data": result.model_dump(mode="json"),
+    }
+
+
+@router.get("/interview/sessions/{session_id}")
+async def get_interview_session(
+    session_id: str,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """返回当前面试会话快照。"""
+
+    result = await interview_service.get_session(session, session_id)
+    return {
+        "code": 200,
+        "message": "success",
+        "data": result.model_dump(mode="json"),
+    }
+
+
+@router.post("/interview/sessions/{session_id}/answers/draft")
+async def save_interview_answer_draft(
+    session_id: str,
+    request: SubmitAnswerRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """暂存当前轮答案。"""
+
+    await interview_service.ensure_session_available(session, session_id, require_active=True)
+    result = await interview_service.save_draft_answer(session, session_id, request)
+    return {
+        "code": 200,
+        "message": "success",
+        "data": result.model_dump(mode="json"),
+    }
+
+
+@router.post("/interview/sessions/{session_id}/answers")
+async def submit_interview_answer(
+    session_id: str,
+    request: SubmitAnswerRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> EventSourceResponse:
+    """提交答案并通过 SSE 推进面试流程。"""
+
+    await interview_service.ensure_session_available(session, session_id, require_active=True)
+
+    async def event_generator():
+        try:
+            async for event in interview_service.submit_answer_stream(session, session_id, request):
+                yield {
+                    "event": "message",
+                    "data": json.dumps(event, ensure_ascii=False),
+                }
+                if event.get("type") in {"done", "error"}:
+                    break
+        except BusinessException as exc:
+            yield {
+                "event": "message",
+                "data": json.dumps(
+                    {
+                        "type": "error",
+                        "code": int(exc.code),
+                        "message": exc.message,
+                        "data": exc.details,
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        except Exception as exc:
+            yield {
+                "event": "message",
+                "data": json.dumps(
+                    {
+                        "type": "error",
+                        "code": int(ErrorCode.INTERNAL_SERVER_ERROR),
+                        "message": "文字面试流程异常",
+                        "data": {"error": str(exc), "session_id": session_id},
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+
+    return EventSourceResponse(event_generator())
+
+
+@router.post("/interview/sessions/{session_id}/complete")
+async def complete_interview_session(
+    session_id: str,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """主动结束面试会话。"""
+
+    await interview_service.ensure_session_available(session, session_id)
+    result = await interview_service.complete_session(session, session_id)
+    return {
+        "code": 200,
+        "message": "success",
+        "data": result.model_dump(mode="json"),
+    }
+

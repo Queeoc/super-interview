@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from app.models.interview import (
     InterviewQuestionSnapshot,
@@ -34,19 +34,18 @@ class _FollowUpOutput(BaseModel):
 
     question_text: str = Field(
         ...,
-        validation_alias="follow_up_question",
+        validation_alias=AliasChoices("question_text", "follow_up_question"),
         min_length=1,
         description="追问内容",
     )
 
 
 class _CompletionOutput(BaseModel):
-    """结束语与占位总结结构化输出。"""
+    """结束语结构化输出。"""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     closing_message: str = Field(..., min_length=1, description="面试结束时对候选人的说明")
-    summary: str = Field(..., min_length=1, description="占位总结，供 Phase 6 前使用")
 
 
 class InterviewExecutor:
@@ -66,7 +65,7 @@ class InterviewExecutor:
         if action == InterviewWorkflowAction.FOLLOW_UP.value:
             return await self._ask_follow_up_question(working_state)
         if action == InterviewWorkflowAction.NEXT_QUESTION.value:
-            return self._ask_next_main_question(working_state)
+            return await self._ask_next_main_question(working_state)
         return await self._complete_interview(working_state)
 
     def _ask_initial_question(self, state: InterviewState) -> InterviewState:
@@ -129,14 +128,14 @@ class InterviewExecutor:
         state["assistant_message"] = follow_up_text
         return state
 
-    def _ask_next_main_question(self, state: InterviewState) -> InterviewState:
+    async def _ask_next_main_question(self, state: InterviewState) -> InterviewState:
         """切换到下一条主问题。"""
 
         next_question = find_next_main_question(state)
         if next_question is None:
             state["next_action"] = InterviewWorkflowAction.COMPLETE.value
             state["action_reason"] = "没有剩余主问题，准备结束面试"
-            return state
+            return await self._complete_interview(state)
 
         asked_question = mark_question_asked(state, next_question["question_key"])
         state["current_question_key"] = next_question["question_key"]
@@ -146,28 +145,14 @@ class InterviewExecutor:
         return state
 
     async def _complete_interview(self, state: InterviewState) -> InterviewState:
-        """生成结束语与占位报告摘要。"""
+        """生成结束语。"""
 
         completion = await self._generate_completion_payload(state)
-        answered_questions = [
-            question
-            for question in state.get("questions", [])
-            if question.get("status") == InterviewQuestionStatus.ANSWERED.value
-        ]
-        report_summary = {
-            "status": "pending",
-            "phase": "phase5-placeholder",
-            "question_count": len(state.get("questions", [])),
-            "answered_question_count": len(answered_questions),
-            "latest_action": InterviewWorkflowAction.COMPLETE.value,
-            "summary": completion.summary,
-            "message": "当前仅生成占位报告，完整统一评估将在 Phase 6 提供。",
-        }
         state["completed"] = True
         state["current_question_key"] = None
         state["assistant_message"] = completion.closing_message
         state["completion_message"] = completion.closing_message
-        state["report_summary"] = report_summary
+        state["report_summary"] = {}
         return state
 
     async def _generate_follow_up_text(
@@ -208,7 +193,10 @@ class InterviewExecutor:
             if output.question_text.strip():
                 return output.question_text.strip()
         except Exception as exc:
-            logger.warning("追问题生成失败，回退规则模板: error={}", exc)
+            logger.warning(
+                "追问题生成触发规则兜底: fallback_applied=true, fallback_type=rule, stage=executor_follow_up, error={}",
+                exc,
+            )
 
         return (
             "你刚才的回答还不够具体。"
@@ -241,22 +229,21 @@ class InterviewExecutor:
 
         try:
             output = await self._prompt_runner.ainvoke_structured(
-                template_name="replanner_system.st",
+                template_name="completion_system.st",
                 schema=_CompletionOutput,
                 variables=variables,
                 temperature=0.2,
             )
             return output
         except Exception as exc:
-            logger.warning("结束语生成失败，回退规则模板: error={}", exc)
+            logger.warning(
+                "结束语生成触发规则兜底: fallback_applied=true, fallback_type=rule, stage=executor_completion, error={}",
+                exc,
+            )
 
         return _CompletionOutput(
             closing_message=(
                 f"{skill['display_name']} 文字面试先到这里。"
-                "本轮回答已经保存，完整统一评估会在后续阶段补齐。"
-            ),
-            summary=(
-                f"已完成 {len(answered_questions)} 轮问答，"
-                "当前报告为 Phase 5 占位摘要，后续将由统一评估引擎补充详细评分。"
+                "本轮回答已经保存，稍后会生成统一评估报告。"
             ),
         )

@@ -82,3 +82,6 @@ dmypy.json
 
 # Ruff
 .ruff_cache/
+
+# Local notes
+问题及解决方式/

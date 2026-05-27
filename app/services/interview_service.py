@@ -28,13 +28,17 @@ from app.agent.interview.state import (
     mark_question_answered,
 )
 from app.config import config
+from app.services.evaluation_service import EvaluationService, evaluation_service as preset_evaluation_service
 from app.core.redis_client import redis_manager
 from app.models.interview import (
     CreateInterviewRequest,
     InterviewAnswerEntity,
     InterviewAnswerStatus,
     InterviewQuestionSnapshot,
+    InterviewQuestionEvaluationDTO,
     InterviewReportEntity,
+    InterviewReportDTO,
+    InterviewReportExportDTO,
     InterviewReportStatus,
     InterviewSessionDTO,
     InterviewSessionEntity,
@@ -134,6 +138,7 @@ class InterviewService:
         executor: InterviewExecutor | None = None,
         replanner: InterviewReplanner | None = None,
         cache: InterviewSessionCache | None = None,
+        evaluation_service: EvaluationService | None = None,
     ) -> None:
         self._skill_service = skill_service or preset_skill_service
         self._persistence_service = persistence_service or InterviewPersistenceService()
@@ -145,6 +150,7 @@ class InterviewService:
         self._executor = executor or InterviewExecutor(self._prompt_runner)
         self._replanner = replanner or InterviewReplanner(self._prompt_runner)
         self._cache = cache or InterviewSessionCache()
+        self._evaluation_service = evaluation_service or preset_evaluation_service
         self._initial_graph = self._build_initial_graph()
         self._advance_graph = self._build_advance_graph()
 
@@ -306,7 +312,7 @@ class InterviewService:
         state["latest_answer_text"] = request.answer_text.strip()
         state["latest_answer_metadata"] = deepcopy(request.answer_metadata)
         state["last_draft_answer"] = {}
-        state["feedback"] = self._build_placeholder_feedback()
+        state["feedback"] = self._build_pending_feedback()
         state["assistant_message"] = None
         state["completion_message"] = None
         state["action_reason"] = None
@@ -330,7 +336,7 @@ class InterviewService:
             answer_status=InterviewAnswerStatus.SUBMITTED.value,
             score_json={
                 "status": "pending",
-                "message": "待 Phase 6 统一评估",
+                "message": "待统一评估",
             },
             feedback_json=deepcopy(transitioned_state.get("feedback", {})),
             answer_metadata_json={
@@ -341,11 +347,11 @@ class InterviewService:
         )
 
         self._apply_state_to_session(interview_session, transitioned_state)
-        report_entity = self._build_report_placeholder(
+        report_entity = None if not transitioned_state.get("completed") else self._build_pending_report_entity(
             interview_session=interview_session,
             state=transitioned_state,
             existing_report=report,
-        ) if transitioned_state.get("completed") else None
+        )
 
         await self._persistence_service.save_answer_and_session_snapshot(
             session,
@@ -372,6 +378,25 @@ class InterviewService:
                 "content": transitioned_state["assistant_message"],
             }
 
+        if transitioned_state.get("completed"):
+            yield {
+                "type": "status",
+                "session_id": session_id,
+                "message": "面试已结束，开始生成统一评估报告",
+            }
+            report_entity = await self._evaluation_service.generate_report(session, session_id)
+            await self._commit_or_raise(
+                session,
+                code=ErrorCode.INTERVIEW_PERSIST_FAILED,
+                message="生成统一评估报告失败",
+                details={"session_id": session_id},
+            )
+            yield {
+                "type": "report",
+                "session_id": session_id,
+                "report": deepcopy(report_entity.report_json),
+            }
+
         step_response = SubmitAnswerResponse(
             session_id=session_id,
             action=transitioned_state.get("next_action", InterviewWorkflowAction.NEXT_QUESTION.value),
@@ -388,13 +413,6 @@ class InterviewService:
             "session_id": session_id,
             "response": step_response.model_dump(mode="json"),
         }
-
-        if report_entity is not None:
-            yield {
-                "type": "report",
-                "session_id": session_id,
-                "report": deepcopy(report_entity.report_json),
-            }
 
         final_dto = self._build_session_dto(
             interview_session,
@@ -422,7 +440,7 @@ class InterviewService:
             state = await self._executor.run(state)
 
         self._apply_state_to_session(interview_session, state)
-        report_entity = self._build_report_placeholder(
+        report_entity = self._build_pending_report_entity(
             interview_session=interview_session,
             state=state,
             existing_report=report,
@@ -439,8 +457,33 @@ class InterviewService:
             message="结束面试会话失败",
             details={"session_id": session_id},
         )
+        report_entity = await self._evaluation_service.generate_report(session, session_id)
+        await self._commit_or_raise(
+            session,
+            code=ErrorCode.INTERVIEW_PERSIST_FAILED,
+            message="生成统一评估报告失败",
+            details={"session_id": session_id},
+        )
         await self._cache.delete_state(session_id)
         return self._build_session_dto(interview_session, state, answers, report_entity)
+
+    async def get_report(
+        self,
+        session: AsyncSession,
+        session_id: str,
+    ) -> InterviewReportDTO:
+        """获取统一评估报告。"""
+
+        return await self._evaluation_service.get_report(session, session_id)
+
+    async def export_report(
+        self,
+        session: AsyncSession,
+        session_id: str,
+    ) -> InterviewReportExportDTO:
+        """导出统一评估报告。"""
+
+        return await self._evaluation_service.export_report(session, session_id)
 
     def _build_initial_graph(self):
         """构建会话初始化图：planner -> executor。"""
@@ -697,36 +740,36 @@ class InterviewService:
             return None
         return InterviewQuestionSnapshot.model_validate(current_question)
 
-    def _build_placeholder_feedback(self) -> dict[str, Any]:
-        """生成 Phase 5 的占位反馈。"""
+    def _build_pending_feedback(self) -> dict[str, Any]:
+        """生成待统一评估的过程反馈。"""
 
         return {
             "status": "pending",
-            "message": "答案已记录，完整统一评估将在 Phase 6 提供。",
-            "phase": "phase5-placeholder",
+            "message": "答案已记录，统一评估将在面试结束后生成。",
+            "phase": "phase6-evaluation-pending",
         }
 
-    def _build_report_placeholder(
+    def _build_pending_report_entity(
         self,
         *,
         interview_session: InterviewSessionEntity,
         state: InterviewState,
         existing_report: InterviewReportEntity | None,
     ) -> InterviewReportEntity:
-        """生成或更新 Phase 5 的占位报告。"""
+        """生成或更新等待统一评估的报告实体。"""
 
         report_entity = existing_report or InterviewReportEntity(session_id=interview_session.id)
         report_entity.status = InterviewReportStatus.PENDING.value
         report_entity.summary_text = state.get("completion_message")
         report_entity.report_json = {
-            **deepcopy(state.get("report_summary", {})),
             "session_id": interview_session.id,
             "skill_id": interview_session.skill_id,
-            "ended_reason": state.get("action_reason"),
+            "status": InterviewReportStatus.PENDING.value,
+            "message": "统一评估报告待生成",
         }
         report_entity.score_json = {
-            "status": "pending",
-            "message": "待 Phase 6 统一评估",
+            "status": InterviewReportStatus.PENDING.value,
+            "message": "统一评估报告待生成",
         }
         report_entity.error_message = None
         return report_entity
@@ -819,4 +862,3 @@ __all__ = [
     "InterviewSessionCache",
     "interview_service",
 ]
-

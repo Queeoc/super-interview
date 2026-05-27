@@ -122,7 +122,10 @@ class InterviewPlanner:
             if normalized_questions:
                 return normalized_questions
         except Exception as exc:
-            logger.warning("主问题计划生成失败，回退规则模板: error={}", exc)
+            logger.warning(
+                "主问题计划触发规则兜底: fallback_applied=true, fallback_type=rule, stage=planner, error={}",
+                exc,
+            )
 
         return self._build_fallback_plan(
             display_name=skill["display_name"],

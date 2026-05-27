@@ -128,3 +128,32 @@ async def complete_interview_session(
         "data": result.model_dump(mode="json"),
     }
 
+
+@router.get("/interview/sessions/{session_id}/report")
+async def get_interview_report(
+    session_id: str,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """返回统一评估报告。"""
+
+    result = await interview_service.get_report(session, session_id)
+    return {
+        "code": 200,
+        "message": "success",
+        "data": result.model_dump(mode="json"),
+    }
+
+
+@router.get("/interview/sessions/{session_id}/report/export")
+async def export_interview_report(
+    session_id: str,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """导出统一评估报告占位内容。"""
+
+    result = await interview_service.export_report(session, session_id)
+    return {
+        "code": 200,
+        "message": "success",
+        "data": result.model_dump(mode="json"),
+    }

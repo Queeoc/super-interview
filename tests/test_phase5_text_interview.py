@@ -1,4 +1,4 @@
-"""Phase 5 文字面试主流程的最小验证。"""
+"""文字面试主流程与统一评估链路的最小验证。"""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from pydantic import BaseModel
 import pytest
 
 from app.agent.interview.executor import InterviewExecutor
+from app.agent.evaluator.batch_evaluator import BatchEvaluator
+from app.agent.evaluator.summarizer import InterviewSummarizer
 from app.agent.interview.planner import InterviewPlanner
 from app.agent.interview.prompts import InterviewPromptRunner
 from app.agent.interview.replanner import InterviewReplanner
@@ -27,6 +29,7 @@ from app.models.interview import (
     InterviewSessionEntity,
     SubmitAnswerRequest,
 )
+from app.services.evaluation_service import EvaluationService
 from app.services.interview_persistence_service import InterviewPersistenceService
 from app.services.interview_service import InterviewService, InterviewSessionCache
 from app.services.skill_service import SkillService
@@ -122,6 +125,11 @@ def _build_test_service() -> tuple[InterviewService, _InMemoryInterviewRepositor
         executor=InterviewExecutor(prompt_runner),
         replanner=InterviewReplanner(prompt_runner),
         cache=InterviewSessionCache(redis_backend=redis_backend),
+        evaluation_service=EvaluationService(
+            batch_evaluator=BatchEvaluator(enable_llm=False),
+            summarizer=InterviewSummarizer(enable_llm=False),
+            repository_factory=lambda _session: repository,  # type: ignore[arg-type]
+        ),
     )
     session = AsyncMock()
     return service, repository, session, redis_backend
@@ -193,6 +201,8 @@ async def test_interview_prompt_runner_uses_json_schema_strict_mode() -> None:
     assert captured["kwargs"]["strict"] is True
     assert captured["kwargs"]["include_raw"] is True
     assert "Return only a JSON object." in captured["prompt_text"]
+    assert "### Schema Contract" in captured["prompt_text"]
+    assert "Canonical JSON example" in captured["prompt_text"]
 
 
 @pytest.mark.asyncio
@@ -400,6 +410,49 @@ async def test_replanner_accepts_optional_next_question_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_executor_uses_completion_prompt_template() -> None:
+    """结束语生成应使用独立 completion prompt，而不是复用 replanner 模板。"""
+
+    captured: dict[str, Any] = {}
+
+    class _RecordingPromptRunner:
+        @staticmethod
+        def wrap_untrusted_text(tag_name: str, content: str) -> str:
+            return f"<{tag_name}>\n{content.strip()}\n</{tag_name}>"
+
+        async def ainvoke_structured(
+            self,
+            *,
+            template_name: str,
+            schema: type[BaseModel],
+            variables: dict[str, Any],
+            model: str | None = None,
+            temperature: float = 0.2,
+        ) -> Any:
+            captured["template_name"] = template_name
+            return schema(closing_message="本次面试到这里先结束，正式评估报告将稍后生成。")
+
+    executor = InterviewExecutor(_RecordingPromptRunner())  # type: ignore[arg-type]
+    state = {
+        "skill": {
+            "display_name": "Python Backend",
+        },
+        "questions": [
+            {
+                "question_key": "q-1",
+                "question_text": "请介绍一个项目。",
+                "status": "answered",
+            }
+        ],
+    }
+
+    result = await executor._generate_completion_payload(state)  # type: ignore[arg-type]
+
+    assert result.closing_message
+    assert captured["template_name"] == "completion_system.st"
+
+
+@pytest.mark.asyncio
 async def test_interview_service_creates_session_and_caches_initial_question() -> None:
     """创建会话后应生成首题、持久化会话并写入缓存。"""
 
@@ -480,8 +533,79 @@ async def test_interview_service_normal_answer_advances_to_next_question() -> No
 
 
 @pytest.mark.asyncio
+async def test_interview_service_last_question_auto_completes_when_no_next_question_exists() -> None:
+    """最后一题即使先进入 next_question 分支，也应在无剩余主问题时自动完成。"""
+
+    service, repository, session, redis_backend = _build_test_service()
+    created = await service.create_session(
+        session,
+        CreateInterviewRequest(skill_id="python-backend", max_rounds=2),
+    )
+
+    first_answer = (
+        "我会先说明缓存目标，再结合热点数据、一致性要求和失效策略设计 Redis 方案，"
+        "同时补充持久化、监控告警和故障降级处理。"
+    )
+    first_events = [
+        event
+        async for event in service.submit_answer_stream(
+            session,
+            created.session_id,
+            SubmitAnswerRequest(answer_text=first_answer),
+        )
+    ]
+    first_plan = next(event for event in first_events if event["type"] == "plan")
+    assert first_plan["action"] == "next_question"
+
+    second_answer = (
+        "这个功能我会从接口契约、事务边界、幂等控制、可观测性和回滚策略五个方面设计，"
+        "并结合一次真实线上问题说明如何验证最终效果。"
+    )
+    original_decide_next_action = service._replanner._decide_next_action
+    service._replanner._decide_next_action = AsyncMock(  # type: ignore[method-assign]
+        return_value=type(
+            "_Decision",
+            (),
+            {
+                "action": "next_question",
+                "reason": "当前问题已获得足够信息，可以进入下一题。",
+            },
+        )()
+    )
+
+    try:
+        second_events = [
+            event
+            async for event in service.submit_answer_stream(
+                session,
+                created.session_id,
+                SubmitAnswerRequest(answer_text=second_answer),
+            )
+        ]
+    finally:
+        service._replanner._decide_next_action = original_decide_next_action  # type: ignore[method-assign]
+
+    plan_event = next(event for event in second_events if event["type"] == "plan")
+    status_event = next(event for event in second_events if event["type"] == "status" and "统一评估报告" in event["message"])
+    report_event = next(event for event in second_events if event["type"] == "report")
+    step_event = next(event for event in second_events if event["type"] == "step_complete")
+    done_event = next(event for event in second_events if event["type"] == "done")
+
+    assert plan_event["action"] == "complete"
+    assert status_event["message"] == "面试已结束，开始生成统一评估报告"
+    assert step_event["response"]["completed"] is True
+    assert step_event["response"]["report_status"] == "generated"
+    assert report_event["report"]["status"] == "generated"
+    assert done_event["session"]["status"] == "completed"
+    assert done_event["session"]["completed"] is True
+    assert done_event["session"]["current_question"] is None
+    assert created.session_id in repository.reports
+    assert redis_backend.storage == {}
+
+
+@pytest.mark.asyncio
 async def test_interview_service_last_round_completes_and_persists_report() -> None:
-    """达到最后一轮时应完成会话并生成占位报告。"""
+    """达到最后一轮时应完成会话并生成统一评估报告。"""
 
     service, repository, session, redis_backend = _build_test_service()
     created = await service.create_session(
@@ -502,13 +626,18 @@ async def test_interview_service_last_round_completes_and_persists_report() -> N
         )
     ]
 
+    status_event = next(event for event in events if event["type"] == "status" and "统一评估报告" in event["message"])
     report_event = next(event for event in events if event["type"] == "report")
+    step_event = next(event for event in events if event["type"] == "step_complete")
     done_event = next(event for event in events if event["type"] == "done")
 
+    assert status_event["message"] == "面试已结束，开始生成统一评估报告"
     assert done_event["session"]["completed"] is True
     assert done_event["session"]["status"] == "completed"
     assert created.session_id in repository.reports
-    assert report_event["report"]["status"] == "pending"
+    assert step_event["response"]["report_status"] == "generated"
+    assert report_event["report"]["status"] == "generated"
+    assert report_event["report"]["overall_score"] is not None
     assert redis_backend.storage == {}
 
 
@@ -569,6 +698,7 @@ def test_interview_api_supports_create_and_sse_submit(
     assert "step_complete" in payload_types
     assert "done" in payload_types
     assert "report" in payload_types
+    assert "status" in payload_types
 
 
 def test_interview_api_returns_domain_error_for_unknown_session(
@@ -605,3 +735,40 @@ def test_interview_api_rejects_blank_answer_payload(
 
     assert response.status_code == 422
     assert response.json()["code"] == 1001
+
+
+def test_interview_api_supports_report_query_and_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """API 应支持报告查询与 Markdown 导出占位。"""
+
+    service, _, session, _ = _build_test_service()
+    client = _build_api_client(monkeypatch, service, session)
+
+    create_response = client.post(
+        "/api/interview/sessions",
+        json={"skill_id": "python-backend", "max_rounds": 1},
+    )
+    session_id = create_response.json()["data"]["session_id"]
+
+    with client.stream(
+        "POST",
+        f"/api/interview/sessions/{session_id}/answers",
+        json={
+            "answer_text": (
+                "我会先做问题拆解，再结合数据库事务、一致性、回滚和监控指标说明完整方案，"
+                "并补充一次真实故障复盘中的处理过程。"
+            )
+        },
+    ) as response:
+        assert response.status_code == 200
+        _ = list(response.iter_lines())
+
+    report_response = client.get(f"/api/interview/sessions/{session_id}/report")
+    export_response = client.get(f"/api/interview/sessions/{session_id}/report/export")
+
+    assert report_response.status_code == 200
+    assert report_response.json()["data"]["status"] == "generated"
+    assert export_response.status_code == 200
+    assert export_response.json()["data"]["export_format"] == "markdown"
+    assert "# 面试评估报告" in export_response.json()["data"]["content"]

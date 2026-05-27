@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Literal
 
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from app.config import config
 from app.models.interview import InterviewWorkflowAction
@@ -21,6 +21,7 @@ class _ReplanDecision(BaseModel):
 
     action: Literal["follow_up", "next_question", "complete"] = Field(
         ...,
+        validation_alias=AliasChoices("next_action", "action"),
         description="下一步动作",
     )
     reason: str = Field(..., min_length=1, description="决策原因")
@@ -94,7 +95,10 @@ class InterviewReplanner:
             )
             return output
         except Exception as exc:
-            logger.warning("面试决策失败，回退规则判断: error={}", exc)
+            logger.warning(
+                "面试决策触发规则兜底: fallback_applied=true, fallback_type=rule, stage=replanner, error={}",
+                exc,
+            )
 
         return self._fallback_decision(state)
 

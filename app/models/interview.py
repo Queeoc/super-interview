@@ -193,8 +193,60 @@ class SubmitAnswerResponse(BaseModel):
         default=None,
         description="下一题或当前待答题",
     )
-    feedback: dict[str, Any] = Field(default_factory=dict, description="占位反馈")
+    feedback: dict[str, Any] = Field(default_factory=dict, description="过程状态或反馈信息")
     report_status: str | None = Field(default=None, description="报告状态")
+
+
+class InterviewQuestionEvaluationDTO(BaseModel):
+    """单题结构化评估结果。"""
+
+    question_key: str = Field(..., description="题目标识")
+    round_index: int = Field(..., ge=1, description="所属轮次")
+    question_text: str = Field(..., description="题目内容")
+    answer_text: str = Field(..., description="候选人回答")
+    score: float = Field(..., ge=0, le=100, description="单题评分")
+    rating: str = Field(..., description="评级标签")
+    strengths: list[str] = Field(default_factory=list, description="本题亮点")
+    weaknesses: list[str] = Field(default_factory=list, description="本题短板")
+    suggestions: list[str] = Field(default_factory=list, description="改进建议")
+    rationale: str = Field(..., description="评分理由")
+    source: str = Field(..., description="评估来源，如 llm 或 fallback")
+
+
+class InterviewReportDTO(BaseModel):
+    """统一评估报告 DTO。"""
+
+    session_id: str = Field(..., description="会话标识")
+    skill_id: str = Field(..., description="Skill 标识")
+    status: str = Field(..., description="报告状态")
+    summary_text: str | None = Field(default=None, description="报告摘要")
+    overall_score: float | None = Field(default=None, description="总体评分")
+    overall_rating: str | None = Field(default=None, description="总体评级")
+    strengths: list[str] = Field(default_factory=list, description="整体亮点")
+    weaknesses: list[str] = Field(default_factory=list, description="整体短板")
+    suggestions: list[str] = Field(default_factory=list, description="整体建议")
+    dimension_scores: dict[str, float] = Field(default_factory=dict, description="维度分")
+    question_evaluations: list[InterviewQuestionEvaluationDTO] = Field(
+        default_factory=list,
+        description="逐题评估",
+    )
+    rubric_name: str | None = Field(default=None, description="采用的评分基线名称")
+    rubric_path: str | None = Field(default=None, description="评分基线路径")
+    generation_mode: str = Field(default="fallback", description="报告生成模式")
+    markdown_content: str = Field(default="", description="Markdown 报告内容")
+    error_message: str | None = Field(default=None, description="失败原因")
+    generated_at: datetime | None = Field(default=None, description="生成时间")
+
+
+class InterviewReportExportDTO(BaseModel):
+    """报告导出占位 DTO。"""
+
+    session_id: str = Field(..., description="会话标识")
+    report_status: str = Field(..., description="报告状态")
+    export_format: str = Field(..., description="导出格式")
+    file_name: str = Field(..., description="导出文件名")
+    content: str = Field(default="", description="导出内容")
+    message: str = Field(..., description="导出说明")
 
 
 class InterviewSessionEntity(Base):

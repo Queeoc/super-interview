@@ -353,6 +353,34 @@ class InterviewSettings(SectionSettings):
             "INTERVIEW_MAX_FOLLOW_UP_QUESTIONS",
         ),
     )
+    evaluation_batch_size: int = Field(
+        default=3,
+        validation_alias=AliasChoices(
+            "INTERVIEW__EVALUATION_BATCH_SIZE",
+            "INTERVIEW_EVALUATION_BATCH_SIZE",
+        ),
+    )
+    structured_output_max_retries: int = Field(
+        default=1,
+        validation_alias=AliasChoices(
+            "INTERVIEW__STRUCTURED_OUTPUT_MAX_RETRIES",
+            "INTERVIEW_STRUCTURED_OUTPUT_MAX_RETRIES",
+        ),
+    )
+    rubric_root_dir: str = Field(
+        default=str(Path(__file__).resolve().parents[1] / "knowledge_base" / "rubrics"),
+        validation_alias=AliasChoices(
+            "INTERVIEW__RUBRIC_ROOT_DIR",
+            "INTERVIEW_RUBRIC_ROOT_DIR",
+        ),
+    )
+    report_export_format: str = Field(
+        default="markdown",
+        validation_alias=AliasChoices(
+            "INTERVIEW__REPORT_EXPORT_FORMAT",
+            "INTERVIEW_REPORT_EXPORT_FORMAT",
+        ),
+    )
 
 
 class SkillSettings(SectionSettings):

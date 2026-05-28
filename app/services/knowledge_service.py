@@ -85,7 +85,7 @@ class KnowledgeService:
         file_content: bytes,
         description: str | None = None,
         skill_id: str | None = None,
-        owner_id: str | None = None,
+        visitor_id: str | None = None,
         content_type: str | None = None,
     ) -> KnowledgeUploadResult:
         """
@@ -100,7 +100,7 @@ class KnowledgeService:
             file_content: 文件字节内容
             description: 知识库描述
             skill_id: 可选 skill 标识
-            owner_id: 可选所有者标识
+            visitor_id: 可选匿名访客标识
             content_type: 上传文件 MIME
 
         Returns:
@@ -166,7 +166,7 @@ class KnowledgeService:
 
         knowledge_base = KnowledgeBaseEntity(
             id=knowledge_base_id,
-            owner_id=owner_id,
+            visitor_id=visitor_id,
             name=sanitized_name,
             description=description,
             category=sanitized_category,

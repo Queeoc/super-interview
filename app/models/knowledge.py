@@ -66,7 +66,7 @@ class KnowledgeBaseEntity(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
-    owner_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    visitor_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     category: Mapped[str] = mapped_column(String(64), nullable=False, default="reference")
@@ -163,7 +163,7 @@ class RagChatSessionEntity(Base):
         nullable=False,
         index=True,
     )
-    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    visitor_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     title: Mapped[str | None] = mapped_column(String(200), nullable=True)
     status: Mapped[str] = mapped_column(
         String(32),

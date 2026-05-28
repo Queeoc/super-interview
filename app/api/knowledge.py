@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
+from app.middleware.visitor_context import get_request_visitor_id
 from app.services.knowledge_service import knowledge_service
 from app.services.rag_service import rag_service
 
@@ -36,13 +37,13 @@ class KnowledgeSearchRequest(BaseModel):
 
 @router.post("/knowledge/upload")
 async def upload_knowledge_document(
+    request: Request,
     file: UploadFile = File(...),
     name: str = Form(...),
     category: str = Form(...),
     source_type: str = Form(...),
     description: str | None = Form(default=None),
     skill_id: str | None = Form(default=None),
-    owner_id: str | None = Form(default=None),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """
@@ -55,7 +56,6 @@ async def upload_knowledge_document(
         source_type: 来源类型
         description: 描述
         skill_id: 可选 skill 标识
-        owner_id: 可选所有者标识
         session: 数据库会话
 
     Returns:
@@ -73,7 +73,7 @@ async def upload_knowledge_document(
             file_content=file_content,
             description=description,
             skill_id=skill_id,
-            owner_id=owner_id,
+            visitor_id=get_request_visitor_id(request),
             content_type=file.content_type,
         )
         return {

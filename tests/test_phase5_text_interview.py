@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 import json
 from typing import Any
 from unittest.mock import AsyncMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -22,6 +22,7 @@ from app.agent.interview.replanner import InterviewReplanner
 from app.api import interview as interview_api
 from app.core.database import get_db_session
 from app.middleware.error_handler import register_exception_handlers
+from app.middleware.visitor_context import VISITOR_ID_COOKIE_NAME, VisitorContextMiddleware
 from app.models.interview import (
     CreateInterviewRequest,
     InterviewAnswerEntity,
@@ -33,6 +34,8 @@ from app.services.evaluation_service import EvaluationService
 from app.services.interview_persistence_service import InterviewPersistenceService
 from app.services.interview_service import InterviewService, InterviewSessionCache
 from app.services.skill_service import SkillService
+
+TEST_VISITOR_ID = "00000000-0000-4000-8000-000000000001"
 
 
 class _InMemoryRedisBackend:
@@ -255,7 +258,7 @@ async def test_planner_falls_back_when_provider_structured_output_fails() -> Non
 
     state = {
         "session_id": "session-1",
-        "user_id": None,
+        "visitor_id": None,
         "resume_id": None,
         "title": "test",
         "language": "zh-CN",
@@ -461,6 +464,7 @@ async def test_interview_service_creates_session_and_caches_initial_question() -
     result = await service.create_session(
         session,
         CreateInterviewRequest(skill_id="python-backend", max_rounds=3),
+        TEST_VISITOR_ID,
     )
 
     assert result.status == "active"
@@ -480,6 +484,7 @@ async def test_interview_service_short_answer_triggers_follow_up() -> None:
     created = await service.create_session(
         session,
         CreateInterviewRequest(skill_id="python-backend", max_rounds=2),
+        TEST_VISITOR_ID,
     )
 
     events = [
@@ -488,6 +493,7 @@ async def test_interview_service_short_answer_triggers_follow_up() -> None:
             session,
             created.session_id,
             SubmitAnswerRequest(answer_text="会用 Redis。"),
+            TEST_VISITOR_ID,
         )
     ]
 
@@ -509,6 +515,7 @@ async def test_interview_service_normal_answer_advances_to_next_question() -> No
     created = await service.create_session(
         session,
         CreateInterviewRequest(skill_id="python-backend", max_rounds=2),
+        TEST_VISITOR_ID,
     )
 
     answer_text = (
@@ -521,6 +528,7 @@ async def test_interview_service_normal_answer_advances_to_next_question() -> No
             session,
             created.session_id,
             SubmitAnswerRequest(answer_text=answer_text),
+            TEST_VISITOR_ID,
         )
     ]
 
@@ -540,6 +548,7 @@ async def test_interview_service_last_question_auto_completes_when_no_next_quest
     created = await service.create_session(
         session,
         CreateInterviewRequest(skill_id="python-backend", max_rounds=2),
+        TEST_VISITOR_ID,
     )
 
     first_answer = (
@@ -552,6 +561,7 @@ async def test_interview_service_last_question_auto_completes_when_no_next_quest
             session,
             created.session_id,
             SubmitAnswerRequest(answer_text=first_answer),
+            TEST_VISITOR_ID,
         )
     ]
     first_plan = next(event for event in first_events if event["type"] == "plan")
@@ -580,6 +590,7 @@ async def test_interview_service_last_question_auto_completes_when_no_next_quest
                 session,
                 created.session_id,
                 SubmitAnswerRequest(answer_text=second_answer),
+                TEST_VISITOR_ID,
             )
         ]
     finally:
@@ -611,6 +622,7 @@ async def test_interview_service_last_round_completes_and_persists_report() -> N
     created = await service.create_session(
         session,
         CreateInterviewRequest(skill_id="python-backend", max_rounds=1),
+        TEST_VISITOR_ID,
     )
 
     answer_text = (
@@ -623,6 +635,7 @@ async def test_interview_service_last_round_completes_and_persists_report() -> N
             session,
             created.session_id,
             SubmitAnswerRequest(answer_text=answer_text),
+            TEST_VISITOR_ID,
         )
     ]
 
@@ -651,13 +664,14 @@ def _build_api_client(
     app = FastAPI()
     register_exception_handlers(app)
     monkeypatch.setattr(interview_api, "interview_service", service)
+    app.add_middleware(VisitorContextMiddleware)
 
     async def override_get_db_session() -> AsyncIterator[AsyncMock]:
         yield session
 
     app.dependency_overrides[get_db_session] = override_get_db_session
     app.include_router(interview_api.router, prefix="/api")
-    return TestClient(app)
+    return TestClient(app, base_url="https://testserver")
 
 
 def test_interview_api_supports_create_and_sse_submit(
@@ -673,6 +687,9 @@ def test_interview_api_supports_create_and_sse_submit(
         json={"skill_id": "python-backend", "max_rounds": 1},
     )
     assert create_response.status_code == 200
+    visitor_id = client.cookies.get(VISITOR_ID_COOKIE_NAME)
+    assert visitor_id is not None
+    assert str(UUID(visitor_id)) == visitor_id
     session_id = create_response.json()["data"]["session_id"]
 
     with client.stream(
@@ -699,6 +716,7 @@ def test_interview_api_supports_create_and_sse_submit(
     assert "done" in payload_types
     assert "report" in payload_types
     assert "status" in payload_types
+    assert create_response.headers.get("set-cookie")
 
 
 def test_interview_api_returns_domain_error_for_unknown_session(
@@ -710,6 +728,27 @@ def test_interview_api_returns_domain_error_for_unknown_session(
     client = _build_api_client(monkeypatch, service, session)
 
     response = client.get("/api/interview/sessions/not-found")
+
+    assert response.status_code == 404
+    assert response.json()["code"] == 3101
+
+
+def test_interview_api_blocks_cross_visitor_session_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """不同匿名访客不应访问彼此的面试会话。"""
+
+    service, _, session, _ = _build_test_service()
+    owner_client = _build_api_client(monkeypatch, service, session)
+    create_response = owner_client.post(
+        "/api/interview/sessions",
+        json={"skill_id": "python-backend", "max_rounds": 1},
+    )
+    assert create_response.status_code == 200
+    session_id = create_response.json()["data"]["session_id"]
+
+    stranger_client = _build_api_client(monkeypatch, service, session)
+    response = stranger_client.get(f"/api/interview/sessions/{session_id}")
 
     assert response.status_code == 404
     assert response.json()["code"] == 3101

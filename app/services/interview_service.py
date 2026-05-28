@@ -158,6 +158,7 @@ class InterviewService:
         self,
         session: AsyncSession,
         session_id: str,
+        visitor_id: str,
         *,
         require_active: bool = False,
     ) -> InterviewSessionEntity:
@@ -173,6 +174,8 @@ class InterviewService:
                 details={"session_id": session_id},
             )
 
+        self._ensure_session_belongs_to_visitor(interview_session, visitor_id)
+
         if require_active and interview_session.status == InterviewSessionStatus.COMPLETED.value:
             raise BusinessException(
                 code=ErrorCode.INTERVIEW_SESSION_COMPLETED,
@@ -186,6 +189,7 @@ class InterviewService:
         self,
         session: AsyncSession,
         request: CreateInterviewRequest,
+        visitor_id: str,
     ) -> InterviewSessionDTO:
         """创建面试会话并同步生成首题。"""
 
@@ -205,14 +209,14 @@ class InterviewService:
             language=language,
             max_rounds=max_rounds,
             title=title,
-            user_id=request.user_id,
+            visitor_id=visitor_id,
             resume_id=request.resume_id,
         )
         planned_state = await self._initial_graph.ainvoke(initial_state)
 
         interview_session = InterviewSessionEntity(
             id=session_id,
-            user_id=request.user_id,
+            visitor_id=visitor_id,
             skill_id=skill_detail.skill_id,
             resume_id=request.resume_id,
             title=title,
@@ -246,10 +250,15 @@ class InterviewService:
         self,
         session: AsyncSession,
         session_id: str,
+        visitor_id: str,
     ) -> InterviewSessionDTO:
         """读取面试会话快照。"""
 
-        interview_session, answers, report, state = await self._load_session_bundle(session, session_id)
+        interview_session, answers, report, state = await self._load_session_bundle(
+            session,
+            session_id,
+            visitor_id,
+        )
         return self._build_session_dto(interview_session, state, answers, report)
 
     async def save_draft_answer(
@@ -257,10 +266,15 @@ class InterviewService:
         session: AsyncSession,
         session_id: str,
         request: SubmitAnswerRequest,
+        visitor_id: str,
     ) -> SubmitAnswerResponse:
         """暂存当前轮答案。"""
 
-        interview_session, answers, report, state = await self._load_session_bundle(session, session_id)
+        interview_session, answers, report, state = await self._load_session_bundle(
+            session,
+            session_id,
+            visitor_id,
+        )
         self._ensure_session_is_active(interview_session)
         current_question = self._require_current_question(state, request.question_key)
 
@@ -296,10 +310,15 @@ class InterviewService:
         session: AsyncSession,
         session_id: str,
         request: SubmitAnswerRequest,
+        visitor_id: str,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """提交答案并通过 SSE 推进主流程。"""
 
-        interview_session, answers, report, state = await self._load_session_bundle(session, session_id)
+        interview_session, answers, report, state = await self._load_session_bundle(
+            session,
+            session_id,
+            visitor_id,
+        )
         self._ensure_session_is_active(interview_session)
         current_question = self._require_current_question(state, request.question_key)
 
@@ -430,10 +449,15 @@ class InterviewService:
         self,
         session: AsyncSession,
         session_id: str,
+        visitor_id: str,
     ) -> InterviewSessionDTO:
         """主动结束面试会话。"""
 
-        interview_session, answers, report, state = await self._load_session_bundle(session, session_id)
+        interview_session, answers, report, state = await self._load_session_bundle(
+            session,
+            session_id,
+            visitor_id,
+        )
         if not state.get("completed"):
             state["next_action"] = InterviewWorkflowAction.COMPLETE.value
             state["action_reason"] = "用户主动结束面试"
@@ -471,18 +495,22 @@ class InterviewService:
         self,
         session: AsyncSession,
         session_id: str,
+        visitor_id: str,
     ) -> InterviewReportDTO:
         """获取统一评估报告。"""
 
+        await self.ensure_session_available(session, session_id, visitor_id)
         return await self._evaluation_service.get_report(session, session_id)
 
     async def export_report(
         self,
         session: AsyncSession,
         session_id: str,
+        visitor_id: str,
     ) -> InterviewReportExportDTO:
         """导出统一评估报告。"""
 
+        await self.ensure_session_available(session, session_id, visitor_id)
         return await self._evaluation_service.export_report(session, session_id)
 
     def _build_initial_graph(self):
@@ -529,6 +557,7 @@ class InterviewService:
         self,
         session: AsyncSession,
         session_id: str,
+        visitor_id: str,
     ) -> tuple[
         InterviewSessionEntity,
         list[InterviewAnswerEntity],
@@ -546,6 +575,8 @@ class InterviewService:
                 http_status=404,
                 details={"session_id": session_id},
             )
+
+        self._ensure_session_belongs_to_visitor(interview_session, visitor_id)
 
         state = await self._load_state_from_cache_or_session(
             interview_session=interview_session,
@@ -577,12 +608,12 @@ class InterviewService:
                     language=interview_session.language,
                     max_rounds=interview_session.max_rounds,
                     title=interview_session.title,
-                    user_id=interview_session.user_id,
+                    visitor_id=interview_session.visitor_id,
                     resume_id=interview_session.resume_id,
                 )
 
         state["session_id"] = interview_session.id
-        state["user_id"] = interview_session.user_id
+        state["visitor_id"] = interview_session.visitor_id
         state["resume_id"] = interview_session.resume_id
         state["title"] = interview_session.title
         state["language"] = interview_session.language
@@ -709,7 +740,6 @@ class InterviewService:
         current_question = self._build_current_question_model(state)
         return InterviewSessionDTO(
             session_id=interview_session.id,
-            user_id=interview_session.user_id,
             resume_id=interview_session.resume_id,
             skill_id=interview_session.skill_id or "",
             skill_display_name=skill_context["display_name"],
@@ -782,6 +812,21 @@ class InterviewService:
                 code=ErrorCode.INTERVIEW_SESSION_COMPLETED,
                 message="面试会话已结束，不能继续答题",
                 http_status=409,
+                details={"session_id": interview_session.id},
+            )
+
+    def _ensure_session_belongs_to_visitor(
+        self,
+        interview_session: InterviewSessionEntity,
+        visitor_id: str,
+    ) -> None:
+        """校验会话归属的匿名访客。"""
+
+        if interview_session.visitor_id != visitor_id:
+            raise BusinessException(
+                code=ErrorCode.INTERVIEW_SESSION_NOT_FOUND,
+                message="面试会话不存在",
+                http_status=404,
                 details={"session_id": interview_session.id},
             )
 

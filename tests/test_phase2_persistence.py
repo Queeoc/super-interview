@@ -128,6 +128,7 @@ async def test_resume_repository_tracks_analysis() -> None:
     session = _FakeAsyncSession()
     repository = ResumeRepository(session)
     resume = ResumeEntity(
+        visitor_id="00000000-0000-4000-8000-000000000001",
         original_file_name="resume.pdf",
         storage_path="/tmp/resume.pdf",
         file_extension=".pdf",
@@ -239,6 +240,7 @@ async def test_resume_persistence_service_orchestrates_repository_calls() -> Non
     session = AsyncMock()
     resume = ResumeEntity(
         id="resume-1",
+        visitor_id="00000000-0000-4000-8000-000000000002",
         original_file_name="resume.pdf",
         storage_path="/tmp/resume.pdf",
         file_extension=".pdf",

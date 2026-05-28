@@ -48,11 +48,11 @@ class ResumeEntity(Base):
 
     __tablename__ = "resumes"
     __table_args__ = (
-        Index("ix_resumes_user_status", "user_id", "status"),
+        Index("ix_resumes_visitor_status", "visitor_id", "status"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
-    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    visitor_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     original_file_name: Mapped[str] = mapped_column(String(255), nullable=False)
     storage_path: Mapped[str] = mapped_column(String(512), nullable=False)
     file_extension: Mapped[str] = mapped_column(String(32), nullable=False)

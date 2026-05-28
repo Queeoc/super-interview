@@ -118,7 +118,6 @@ class CreateInterviewRequest(BaseModel):
     """创建文字面试会话请求。"""
 
     skill_id: str = Field(..., min_length=1, description="预设 Skill 标识")
-    user_id: str | None = Field(default=None, description="用户标识")
     resume_id: str | None = Field(default=None, description="关联简历标识")
     title: str | None = Field(default=None, description="会话标题")
     language: str | None = Field(default=None, description="面试语言")
@@ -151,7 +150,6 @@ class InterviewSessionDTO(BaseModel):
     """对外暴露的面试会话快照。"""
 
     session_id: str = Field(..., description="会话标识")
-    user_id: str | None = Field(default=None, description="用户标识")
     resume_id: str | None = Field(default=None, description="简历标识")
     skill_id: str = Field(..., description="Skill 标识")
     skill_display_name: str = Field(..., description="Skill 展示名称")
@@ -259,12 +257,12 @@ class InterviewSessionEntity(Base):
 
     __tablename__ = "interview_sessions"
     __table_args__ = (
-        Index("ix_interview_sessions_user_status", "user_id", "status"),
+        Index("ix_interview_sessions_visitor_status", "visitor_id", "status"),
         Index("ix_interview_sessions_skill_status", "skill_id", "status"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
-    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    visitor_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     skill_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     resume_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     title: Mapped[str | None] = mapped_column(String(200), nullable=True)

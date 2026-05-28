@@ -9,7 +9,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/postgres:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d super_interview"]
       interval: 10s
@@ -101,3 +101,6 @@ services:
 networks:
   default:
     name: super-interview-dev
+
+volumes:
+  postgres_data:

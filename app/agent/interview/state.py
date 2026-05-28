@@ -39,7 +39,7 @@ class InterviewState(TypedDict, total=False):
     """
 
     session_id: str
-    user_id: str | None
+    visitor_id: str | None
     resume_id: str | None
     title: str | None
     language: str
@@ -69,14 +69,14 @@ def build_initial_state(
     language: str,
     max_rounds: int,
     title: str | None,
-    user_id: str | None,
+    visitor_id: str | None,
     resume_id: str | None,
 ) -> InterviewState:
     """创建一个可直接进入初始化工作流的状态对象。"""
 
     return {
         "session_id": session_id,
-        "user_id": user_id,
+        "visitor_id": visitor_id,
         "resume_id": resume_id,
         "title": title,
         "language": language,
@@ -234,4 +234,3 @@ def build_session_context_payload(state: InterviewState) -> dict[str, Any]:
         "assistant_message": state.get("assistant_message"),
         "workflow_state": serialize_state(state),
     }
-

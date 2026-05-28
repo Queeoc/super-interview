@@ -18,6 +18,7 @@ from app.core.milvus_client import milvus_manager
 from app.core.redis_client import redis_manager
 from app.core.storage_client import storage_manager
 from app.middleware.error_handler import register_exception_handlers
+from app.middleware.visitor_context import VisitorContextMiddleware
 from app.api import aiops, chat, file, health, interview, knowledge, skill
 from app.utils.exceptions import ErrorCode, InfrastructureException
 from app.utils.logger import setup_logger
@@ -117,6 +118,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(VisitorContextMiddleware)
 
 # 注册路由
 app.include_router(health.router, tags=["健康检查"])

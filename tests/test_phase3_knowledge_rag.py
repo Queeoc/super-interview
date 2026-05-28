@@ -7,9 +7,15 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 import pytest
 
+from app.api import knowledge as knowledge_api
 from app.config import config
+from app.core.database import get_db_session
+from app.middleware.error_handler import register_exception_handlers
+from app.middleware.visitor_context import VISITOR_ID_COOKIE_NAME, VisitorContextMiddleware
 from app.models.knowledge import (
     KnowledgeBaseEntity,
     KnowledgeDocumentEntity,
@@ -180,6 +186,27 @@ class _FakeVectorStore:
         return list(self.hits)
 
 
+class _ApiKnowledgeUploadResult:
+    """用于知识库上传 API 测试的最小返回对象。"""
+
+    def __init__(self) -> None:
+        self.payload = {
+            "knowledge_base_id": "kb-1",
+            "document_id": "doc-1",
+            "name": "Python 面试参考",
+            "category": "reference_knowledge",
+            "source_type": "manual",
+            "skill_id": "python-backend",
+            "file_name": "python.md",
+            "file_size": 32,
+            "index_status": "indexed",
+            "chunk_count": 2,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.payload)
+
+
 class _SuccessfulRewriteModel:
     """返回稳定文本的假改写模型。"""
 
@@ -247,11 +274,13 @@ async def test_knowledge_service_uploads_and_indexes_document() -> None:
         file_name="python.md",
         file_content=b"# Python\nclosures and decorators",
         skill_id="python-backend",
+        visitor_id="00000000-0000-4000-8000-000000000011",
         content_type="text/markdown",
     )
 
     assert len(repository.added_knowledge_bases) == 1
     assert len(repository.added_documents) == 1
+    assert repository.added_knowledge_bases[0].visitor_id == "00000000-0000-4000-8000-000000000011"
     assert storage_client.calls[0]["object_key"].startswith("knowledge/")
     assert session.commit.await_count == 3
     assert repository.document_update_snapshots[0]["index_status"] == (
@@ -286,6 +315,7 @@ async def test_knowledge_service_marks_document_failed_when_indexing_fails() -> 
             source_type="manual",
             file_name="rubric.md",
             file_content=b"# rubric\nscore by rubric",
+            visitor_id="00000000-0000-4000-8000-000000000012",
         )
 
     assert exc_info.value.code == ErrorCode.KNOWLEDGE_INDEX_FAILED
@@ -378,3 +408,54 @@ async def test_rag_service_falls_back_to_original_query_when_rewrite_fails() -> 
     assert vector_store.calls[0]["query"] == "Python 装饰器"
     assert result.used_rewrite is False
     assert result.rewritten_query == "Python 装饰器"
+
+
+def _build_knowledge_api_client(
+    monkeypatch: pytest.MonkeyPatch,
+    upload_mock: AsyncMock,
+    session: AsyncMock,
+) -> TestClient:
+    """构建挂载知识库路由的测试客户端。"""
+
+    app = FastAPI()
+    register_exception_handlers(app)
+    app.add_middleware(VisitorContextMiddleware)
+
+    monkeypatch.setattr(
+        knowledge_api,
+        "knowledge_service",
+        SimpleNamespace(upload_knowledge_document=upload_mock),
+    )
+
+    async def override_get_db_session():
+        yield session
+
+    app.dependency_overrides[get_db_session] = override_get_db_session
+    app.include_router(knowledge_api.router, prefix="/api")
+    return TestClient(app, base_url="https://testserver")
+
+
+def test_knowledge_upload_api_uses_request_visitor_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """知识库上传接口应从请求上下文读取 visitor_id，而不是暴露 owner_id。"""
+
+    upload_mock = AsyncMock(return_value=_ApiKnowledgeUploadResult())
+    client = _build_knowledge_api_client(monkeypatch, upload_mock, AsyncMock())
+
+    response = client.post(
+        "/api/knowledge/upload",
+        data={
+            "name": "Python 面试参考",
+            "category": "reference_knowledge",
+            "source_type": "manual",
+            "skill_id": "python-backend",
+        },
+        files={"file": ("python.md", b"# Python\nclosures", "text/markdown")},
+    )
+
+    assert response.status_code == 200
+    visitor_id = client.cookies.get(VISITOR_ID_COOKIE_NAME)
+    assert visitor_id is not None
+    assert upload_mock.await_args.kwargs["visitor_id"] == visitor_id
+    assert "owner_id" not in upload_mock.await_args.kwargs

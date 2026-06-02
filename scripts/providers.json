@@ -1,0 +1,51 @@
+[
+  {
+    "provider_code": "qwen-max",
+    "provider_name": "qwen-max",
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model_name": "qwen-max",
+    "api_key": "sk-8561753e5821431ca56712938b0fa548"
+  },
+  {
+    "provider_code": "qwen3-max",
+    "provider_name": "qwen3-max",
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model_name": "qwen3-max",
+    "api_key": "sk-8561753e5821431ca56712938b0fa548"
+  },
+  {
+    "provider_code": "qwen3.7-plus",
+    "provider_name": "qwen3.7-plus",
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model_name": "qwen3.7-plus",
+    "api_key": "sk-8561753e5821431ca56712938b0fa548"
+  },
+  {
+    "provider_code": "qwen-plus-2025-07-28",
+    "provider_name": "qwen-plus-2025-07-28",
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model_name": "qwen-plus-2025-07-28",
+    "api_key": "sk-8561753e5821431ca56712938b0fa548"
+  },
+  {
+    "provider_code": "glm-5",
+    "provider_name": "glm-5",
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model_name": "glm-5",
+    "api_key": "sk-8561753e5821431ca56712938b0fa548"
+  },
+  {
+    "provider_code": "qwen3.6-plus",
+    "provider_name": "qwen3.6-plus",
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model_name": "qwen3.6-plus",
+    "api_key": "sk-8561753e5821431ca56712938b0fa548"
+  },
+  {
+    "provider_code": "qwen3-32b",
+    "provider_name": "qwen3-32b",
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model_name": "qwen3-32b",
+    "api_key": "sk-8561753e5821431ca56712938b0fa548"
+  }
+]

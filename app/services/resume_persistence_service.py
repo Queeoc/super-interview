@@ -57,5 +57,48 @@ class ResumePersistenceService:
         repository = self._resolve_repository(session)
         return await repository.upsert_resume(resume)
 
+    async def get_resume_by_visitor(
+        self,
+        session: AsyncSession,
+        resume_id: str,
+        visitor_id: str,
+    ) -> ResumeEntity | None:
+        """按访客作用域查询单份简历。"""
+
+        repository = self._resolve_repository(session)
+        return await repository.get_resume_by_visitor(resume_id, visitor_id)
+
+    async def get_resume_by_visitor_and_content_hash(
+        self,
+        session: AsyncSession,
+        visitor_id: str,
+        content_hash: str,
+    ) -> ResumeEntity | None:
+        """按访客和内容哈希查询可复用简历。"""
+
+        repository = self._resolve_repository(session)
+        return await repository.get_resume_by_visitor_and_content_hash(visitor_id, content_hash)
+
+    async def list_resumes_by_visitor(
+        self,
+        session: AsyncSession,
+        visitor_id: str,
+        limit: int = 20,
+    ) -> list[ResumeEntity]:
+        """查询访客历史简历列表。"""
+
+        repository = self._resolve_repository(session)
+        return await repository.list_resumes_by_visitor(visitor_id, limit=limit)
+
+    async def get_latest_available_resume_by_visitor(
+        self,
+        session: AsyncSession,
+        visitor_id: str,
+    ) -> ResumeEntity | None:
+        """查询访客最近一份可用于面试的简历。"""
+
+        repository = self._resolve_repository(session)
+        return await repository.get_latest_available_resume_by_visitor(visitor_id)
+
 
 __all__ = ["ResumePersistenceService"]

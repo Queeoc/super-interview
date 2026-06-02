@@ -1,0 +1,124 @@
+.shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(16rem, 22rem) 1fr;
+  align-items: start;
+  background:
+    radial-gradient(circle at top left, rgba(233, 122, 73, 0.18), transparent 28%),
+    radial-gradient(circle at bottom right, rgba(33, 99, 235, 0.14), transparent 24%),
+    var(--color-surface-canvas);
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+  padding: var(--space-8);
+  position: sticky;
+  top: 0;
+  align-self: start;
+  min-height: 100vh;
+  max-height: 100vh;
+  overflow-y: auto;
+  border-right: 1px solid var(--color-border-muted);
+  background: linear-gradient(180deg, rgba(255, 248, 238, 0.92), rgba(247, 245, 240, 0.92));
+  backdrop-filter: blur(12px);
+}
+
+.brand {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.brandEyebrow {
+  display: inline-flex;
+  width: fit-content;
+  padding: 0.4rem 0.7rem;
+  border-radius: 999px;
+  background: var(--color-brand-soft);
+  color: var(--color-brand-strong);
+  font-size: var(--font-size-12);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.brandTitle {
+  margin: 0;
+  font-size: clamp(2rem, 3vw, 2.8rem);
+  line-height: 0.95;
+  letter-spacing: -0.04em;
+}
+
+.brandSubtitle {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-16);
+  line-height: 1.6;
+}
+
+.nav {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.navLink {
+  display: block;
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid transparent;
+  border-radius: var(--radius-xl);
+  color: var(--color-text-primary);
+  background: rgba(255, 255, 255, 0.56);
+  text-decoration: none;
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    background-color 160ms ease;
+}
+
+.navLink:hover {
+  transform: translateY(-1px);
+  border-color: var(--color-border-strong);
+  box-shadow: var(--shadow-soft);
+}
+
+.navLinkActive {
+  border-color: var(--color-brand-strong);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-soft);
+}
+
+.sidebarFooter {
+  margin-top: auto;
+  display: grid;
+  gap: var(--space-2);
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-14);
+}
+
+.sidebarFooter p {
+  margin: 0;
+}
+
+.content {
+  min-width: 0;
+  min-height: 100vh;
+  padding: clamp(var(--space-5), 2vw, var(--space-8));
+}
+
+@media (max-width: 960px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    position: static;
+    min-height: auto;
+    max-height: none;
+    overflow-y: visible;
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border-muted);
+  }
+}

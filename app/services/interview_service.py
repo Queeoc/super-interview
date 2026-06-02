@@ -28,9 +28,11 @@ from app.agent.interview.state import (
     mark_question_answered,
 )
 from app.config import config
+from app.core.stream_producer import StreamProducer, StreamTaskEnvelope, stream_producer
 from app.services.evaluation_service import EvaluationService, evaluation_service as preset_evaluation_service
 from app.core.redis_client import redis_manager
 from app.models.interview import (
+    InterviewAnswerHistoryDTO,
     CreateInterviewRequest,
     InterviewAnswerEntity,
     InterviewAnswerStatus,
@@ -40,6 +42,7 @@ from app.models.interview import (
     InterviewReportDTO,
     InterviewReportExportDTO,
     InterviewReportStatus,
+    InterviewSessionSummaryDTO,
     InterviewSessionDTO,
     InterviewSessionEntity,
     InterviewSessionStatus,
@@ -49,6 +52,7 @@ from app.models.interview import (
 )
 from app.repositories.interview_repository import InterviewRepository
 from app.services.interview_persistence_service import InterviewPersistenceService
+from app.services.resume_service import ResumeService, resume_service as preset_resume_service
 from app.services.skill_service import SkillService, skill_service as preset_skill_service
 from app.utils.exceptions import BusinessException, ErrorCode
 
@@ -132,6 +136,7 @@ class InterviewService:
         *,
         skill_service: SkillService | None = None,
         persistence_service: InterviewPersistenceService | None = None,
+        resume_service: ResumeService | None = None,
         repository_factory: Callable[[AsyncSession], InterviewRepository] | None = None,
         prompt_runner: InterviewPromptRunner | None = None,
         planner: InterviewPlanner | None = None,
@@ -139,9 +144,11 @@ class InterviewService:
         replanner: InterviewReplanner | None = None,
         cache: InterviewSessionCache | None = None,
         evaluation_service: EvaluationService | None = None,
+        stream_producer_backend: StreamProducer | None = None,
     ) -> None:
         self._skill_service = skill_service or preset_skill_service
         self._persistence_service = persistence_service or InterviewPersistenceService()
+        self._resume_service = resume_service or preset_resume_service
         self._repository_factory = repository_factory or InterviewRepository
         self._prompt_runner = prompt_runner or InterviewPromptRunner(
             enable_llm=bool(config.dashscope_api_key),
@@ -151,6 +158,7 @@ class InterviewService:
         self._replanner = replanner or InterviewReplanner(self._prompt_runner)
         self._cache = cache or InterviewSessionCache()
         self._evaluation_service = evaluation_service or preset_evaluation_service
+        self._stream_producer = stream_producer_backend or stream_producer
         self._initial_graph = self._build_initial_graph()
         self._advance_graph = self._build_advance_graph()
 
@@ -195,6 +203,12 @@ class InterviewService:
 
         skill_detail = self._skill_service.get_skill_detail(request.skill_id)
         reference_section = self._skill_service.build_reference_section(request.skill_id)
+        resume_context = await self._resume_service.resolve_resume_for_interview(
+            session,
+            visitor_id=visitor_id,
+            resume_id=request.resume_id,
+        )
+        resolved_resume_id = resume_context.resume_id if resume_context else None
         session_id = self._generate_identifier()
         max_rounds = min(
             request.max_rounds or config.interview.max_rounds,
@@ -205,12 +219,20 @@ class InterviewService:
 
         initial_state = build_initial_state(
             session_id=session_id,
-            skill=self._build_skill_context(skill_detail, reference_section.reference_markdown, reference_section.resolved_reference_files),
+            skill=self._build_skill_context(
+                skill_detail,
+                reference_section.reference_markdown,
+                reference_section.resolved_reference_files,
+                resume_markdown=resume_context.markdown_content if resume_context else "",
+                resume_metadata=resume_context.metadata if resume_context else {},
+            ),
             language=language,
             max_rounds=max_rounds,
             title=title,
             visitor_id=visitor_id,
-            resume_id=request.resume_id,
+            resume_id=resolved_resume_id,
+            resume_markdown=resume_context.markdown_content if resume_context else "",
+            resume_metadata=resume_context.metadata if resume_context else {},
         )
         planned_state = await self._initial_graph.ainvoke(initial_state)
 
@@ -218,7 +240,7 @@ class InterviewService:
             id=session_id,
             visitor_id=visitor_id,
             skill_id=skill_detail.skill_id,
-            resume_id=request.resume_id,
+            resume_id=resolved_resume_id,
             title=title,
             language=language,
             mode=config.interview.default_mode,
@@ -227,7 +249,13 @@ class InterviewService:
             max_rounds=max_rounds,
             questions_json=list_questions(planned_state),
             session_context_json=build_session_context_payload(planned_state),
-            metadata_json=self._build_session_metadata(skill_detail, reference_section.reference_markdown, reference_section.resolved_reference_files),
+            metadata_json=self._build_session_metadata(
+                skill_detail,
+                reference_section.reference_markdown,
+                reference_section.resolved_reference_files,
+                resume_markdown=resume_context.markdown_content if resume_context else "",
+                resume_metadata=resume_context.metadata if resume_context else {},
+            ),
             started_at=_utc_now(),
         )
 
@@ -260,6 +288,38 @@ class InterviewService:
             visitor_id,
         )
         return self._build_session_dto(interview_session, state, answers, report)
+
+    async def list_sessions(
+        self,
+        session: AsyncSession,
+        *,
+        visitor_id: str,
+        limit: int = 20,
+    ) -> list[InterviewSessionSummaryDTO]:
+        """列出当前访客的历史面试会话摘要。"""
+
+        repository = self._get_repository(session)
+        sessions = await repository.list_sessions_by_visitor(visitor_id, limit=limit)
+        summaries: list[InterviewSessionSummaryDTO] = []
+
+        for interview_session in sessions:
+            answers = await repository.list_answers_by_session(interview_session.id)
+            report = await repository.get_report_by_session(interview_session.id)
+            state = await self._load_state_from_cache_or_session(
+                interview_session=interview_session,
+                answers=answers,
+                report=report,
+            )
+            summaries.append(
+                self._build_session_summary_dto(
+                    interview_session=interview_session,
+                    state=state,
+                    answer_count=len(answers),
+                    report=report,
+                )
+            )
+
+        return summaries
 
     async def save_draft_answer(
         self,
@@ -403,12 +463,12 @@ class InterviewService:
                 "session_id": session_id,
                 "message": "面试已结束，开始生成统一评估报告",
             }
-            report_entity = await self._evaluation_service.generate_report(session, session_id)
-            await self._commit_or_raise(
+            report_entity = await self._schedule_or_generate_report(
                 session,
-                code=ErrorCode.INTERVIEW_PERSIST_FAILED,
-                message="生成统一评估报告失败",
-                details={"session_id": session_id},
+                session_id=session_id,
+                interview_session=interview_session,
+                state=transitioned_state,
+                existing_report=report_entity or report,
             )
             yield {
                 "type": "report",
@@ -481,12 +541,12 @@ class InterviewService:
             message="结束面试会话失败",
             details={"session_id": session_id},
         )
-        report_entity = await self._evaluation_service.generate_report(session, session_id)
-        await self._commit_or_raise(
+        report_entity = await self._schedule_or_generate_report(
             session,
-            code=ErrorCode.INTERVIEW_PERSIST_FAILED,
-            message="生成统一评估报告失败",
-            details={"session_id": session_id},
+            session_id=session_id,
+            interview_session=interview_session,
+            state=state,
+            existing_report=report_entity,
         )
         await self._cache.delete_state(session_id)
         return self._build_session_dto(interview_session, state, answers, report_entity)
@@ -610,6 +670,8 @@ class InterviewService:
                     title=interview_session.title,
                     visitor_id=interview_session.visitor_id,
                     resume_id=interview_session.resume_id,
+                    resume_markdown=str((interview_session.metadata_json or {}).get("resume_markdown", "")),
+                    resume_metadata=deepcopy((interview_session.metadata_json or {}).get("resume_metadata", {})),
                 )
 
         state["session_id"] = interview_session.id
@@ -618,6 +680,17 @@ class InterviewService:
         state["title"] = interview_session.title
         state["language"] = interview_session.language
         state["max_rounds"] = interview_session.max_rounds
+        resume_markdown = interview_session.session_context_json.get(
+            "resume_markdown",
+            state.get("resume_markdown", (interview_session.metadata_json or {}).get("resume_markdown", "")),
+        )
+        state["resume_markdown"] = str(resume_markdown or "")
+        state["resume_metadata"] = deepcopy(
+            interview_session.session_context_json.get(
+                "resume_metadata",
+                state.get("resume_metadata", (interview_session.metadata_json or {}).get("resume_metadata", {})),
+            )
+        )
         state["skill"] = self._build_skill_context_from_entity(interview_session)
         state["questions"] = list(interview_session.questions_json or [])
         state["current_round"] = interview_session.current_round
@@ -660,6 +733,8 @@ class InterviewService:
             **deepcopy(interview_session.metadata_json),
             "latest_feedback": deepcopy(state.get("feedback", {})),
             "last_action": state.get("next_action"),
+            "resume_markdown": state.get("resume_markdown", ""),
+            "resume_metadata": deepcopy(state.get("resume_metadata", {})),
         }
         if state.get("completed"):
             interview_session.status = InterviewSessionStatus.COMPLETED.value
@@ -672,6 +747,9 @@ class InterviewService:
         skill_detail: Any,
         reference_markdown: str,
         reference_files: list[str],
+        *,
+        resume_markdown: str,
+        resume_metadata: dict[str, Any],
     ) -> dict[str, Any]:
         """构建会话元数据。"""
 
@@ -684,6 +762,8 @@ class InterviewService:
             ],
             "reference_markdown": reference_markdown,
             "reference_files": reference_files,
+            "resume_markdown": resume_markdown,
+            "resume_metadata": deepcopy(resume_metadata),
         }
 
     def _build_skill_context(
@@ -691,6 +771,9 @@ class InterviewService:
         skill_detail: Any,
         reference_markdown: str,
         reference_files: list[str],
+        *,
+        resume_markdown: str,
+        resume_metadata: dict[str, Any],
     ) -> InterviewSkillContext:
         """根据 Skill 服务结果构建工作流上下文。"""
 
@@ -704,6 +787,8 @@ class InterviewService:
                 category.model_dump(mode="json") for category in skill_detail.categories
             ],
             "reference_files": reference_files,
+            "resume_markdown": resume_markdown,
+            "resume_metadata": deepcopy(resume_metadata),
         }
 
     def _build_skill_context_from_entity(
@@ -721,6 +806,8 @@ class InterviewService:
             "reference_markdown": str(metadata.get("reference_markdown", "")),
             "categories": list(metadata.get("skill_categories", [])),
             "reference_files": list(metadata.get("reference_files", [])),
+            "resume_markdown": str(metadata.get("resume_markdown", "")),
+            "resume_metadata": deepcopy(metadata.get("resume_metadata", {})),
         }
 
     def _build_session_dto(
@@ -750,12 +837,56 @@ class InterviewService:
             max_rounds=interview_session.max_rounds,
             current_question=current_question,
             questions=question_models,
+            answers=[
+                InterviewAnswerHistoryDTO(
+                    answer_id=answer.id,
+                    round_index=answer.round_index,
+                    question_key=answer.question_key,
+                    question_text=answer.question_text,
+                    answer_text=answer.answer_text,
+                    answer_status=answer.answer_status,
+                    submitted_at=answer.submitted_at,
+                    answer_metadata=deepcopy(answer.answer_metadata_json),
+                    feedback=deepcopy(answer.feedback_json),
+                )
+                for answer in answers
+            ],
             answer_count=len(answers),
             follow_up_count=int(state.get("follow_up_count", 0)),
             completed=bool(state.get("completed", False)),
             report_status=report.status if report else None,
             last_draft_answer=deepcopy(state.get("last_draft_answer", {})),
             started_at=interview_session.started_at,
+            completed_at=interview_session.completed_at,
+        )
+
+    def _build_session_summary_dto(
+        self,
+        *,
+        interview_session: InterviewSessionEntity,
+        state: InterviewState,
+        answer_count: int,
+        report: InterviewReportEntity | None,
+    ) -> InterviewSessionSummaryDTO:
+        """将会话实体转换为列表页使用的摘要 DTO。"""
+
+        skill_context = state["skill"]
+        return InterviewSessionSummaryDTO(
+            session_id=interview_session.id,
+            resume_id=interview_session.resume_id,
+            skill_id=interview_session.skill_id or "",
+            skill_display_name=skill_context["display_name"],
+            title=interview_session.title,
+            language=interview_session.language,
+            status=interview_session.status,
+            current_round=interview_session.current_round,
+            max_rounds=interview_session.max_rounds,
+            answer_count=answer_count,
+            completed=bool(state.get("completed", False)),
+            report_status=report.status if report else None,
+            current_question=self._build_current_question_model(state),
+            started_at=interview_session.started_at,
+            updated_at=interview_session.updated_at,
             completed_at=interview_session.completed_at,
         )
 
@@ -802,6 +933,69 @@ class InterviewService:
             "message": "统一评估报告待生成",
         }
         report_entity.error_message = None
+        return report_entity
+
+    async def _schedule_or_generate_report(
+        self,
+        session: AsyncSession,
+        *,
+        session_id: str,
+        interview_session: InterviewSessionEntity,
+        state: InterviewState,
+        existing_report: InterviewReportEntity | None,
+    ) -> InterviewReportEntity:
+        """优先异步发布报告任务，失败时同步回退。"""
+
+        report_entity = self._build_pending_report_entity(
+            interview_session=interview_session,
+            state=state,
+            existing_report=existing_report,
+        )
+        try:
+            if not self._stream_producer.enabled or not config.stream_task.synchronous_fallback_enabled:
+                raise RuntimeError("stream task disabled")
+            envelope = StreamTaskEnvelope.new(
+                task_type="interview_report_generate",
+                payload={
+                    "session_id": session_id,
+                },
+                trace_context={
+                    "session_id": session_id,
+                    "skill_id": interview_session.skill_id,
+                },
+            )
+            await self._stream_producer.publish(envelope)
+        except Exception as exc:
+            logger.warning("异步报告发布失败，回退同步评估: session_id={}, error={}", session_id, exc)
+            report_entity = await self._evaluation_service.generate_report(session, session_id)
+            await self._commit_or_raise(
+                session,
+                code=ErrorCode.INTERVIEW_PERSIST_FAILED,
+                message="生成统一评估报告失败",
+                details={"session_id": session_id},
+            )
+            return report_entity
+
+        report_entity.status = InterviewReportStatus.PENDING.value
+        report_entity.report_json = {
+            "session_id": session_id,
+            "skill_id": interview_session.skill_id,
+            "status": InterviewReportStatus.PENDING.value,
+            "message": "统一评估报告已进入异步队列，请稍后刷新查看结果。",
+            "task_id": envelope.task_id,
+        }
+        report_entity.score_json = {
+            "status": InterviewReportStatus.PENDING.value,
+            "message": "统一评估报告已进入异步队列，请稍后刷新查看结果。",
+            "task_id": envelope.task_id,
+        }
+        report_entity = await self._persistence_service.save_report(session, report_entity)
+        await self._commit_or_raise(
+            session,
+            code=ErrorCode.INTERVIEW_PERSIST_FAILED,
+            message="更新异步报告状态失败",
+            details={"session_id": session_id, "task_id": envelope.task_id},
+        )
         return report_entity
 
     def _ensure_session_is_active(self, interview_session: InterviewSessionEntity) -> None:

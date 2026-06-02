@@ -63,6 +63,22 @@ class InterviewRepository:
         result = await self._session.scalars(stmt)
         return list(result.all())
 
+    async def list_sessions_by_visitor(
+        self,
+        visitor_id: str,
+        limit: int = 20,
+    ) -> list[InterviewSessionEntity]:
+        """按访客查询其历史面试会话。"""
+
+        stmt = (
+            select(InterviewSessionEntity)
+            .where(InterviewSessionEntity.visitor_id == visitor_id)
+            .order_by(desc(InterviewSessionEntity.updated_at), desc(InterviewSessionEntity.created_at))
+            .limit(limit)
+        )
+        result = await self._session.scalars(stmt)
+        return list(result.all())
+
     async def add_answer(self, entity: InterviewAnswerEntity) -> InterviewAnswerEntity:
         """新增答案记录。"""
 
@@ -133,11 +149,25 @@ class InterviewRepository:
         return list(result.all())
 
     async def upsert_report(self, entity: InterviewReportEntity) -> InterviewReportEntity:
-        """创建或更新面试报告。"""
+        """按 session_id 幂等创建或更新面试报告。"""
 
-        merged = await self._session.merge(entity)
+        existing = None
+        if entity.session_id:
+            existing = await self.get_report_by_session(entity.session_id)
+
+        if existing is None:
+            self._session.add(entity)
+            await self._session.flush()
+            return entity
+
+        existing.status = entity.status
+        existing.summary_text = entity.summary_text
+        existing.report_json = dict(entity.report_json or {})
+        existing.score_json = dict(entity.score_json or {})
+        existing.error_message = entity.error_message
+        existing.generated_at = entity.generated_at
         await self._session.flush()
-        return merged
+        return existing
 
     async def get_report_by_session(self, session_id: str) -> InterviewReportEntity | None:
         """按会话 ID 查询报告。"""

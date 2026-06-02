@@ -253,6 +253,23 @@ cp .env.example .env
 
 > 另外说明：这个仓库是在原有 `biz_agent` 能力底座上重构而来，早期文档或一些脚本里仍可能出现 `biz_agent` 相关字样，它们表示历史来源或本地兼容项，不代表仓库对外名称。
 
+### 开发环境 PostgreSQL 重建
+
+开发阶段如果 ORM 模型已经演进、而本地 PostgreSQL 仍保留旧表结构，可以使用：
+
+```bash
+python scripts/init_dev_db.py
+```
+
+注意：
+
+- 该脚本仅适用于纯开发库
+- 脚本会先诊断受管表的缺列、多列和缺表情况
+- 随后会直接重置当前数据库的 `public` schema
+- `public` schema 下的历史表和数据会被全部删除
+- 脚本会按当前 ORM 元数据重新创建 10 张受管表
+- 不适用于生产环境，也不应替代正式迁移工具
+
 ```bash
 # 阿里云LLM DashScope 配置（必填）
 # 秘钥管理： https://bailian.console.aliyun.com/cn-beijing/?spm=5176.29597918.J_SEsSjsNv72yRuRFS2VknO.2.61ac133ccTVQLw&tab=demohouse#/api-key

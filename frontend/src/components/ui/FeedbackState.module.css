@@ -1,0 +1,38 @@
+.state {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-5);
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--color-border-muted);
+  background: rgba(255, 255, 255, 0.74);
+}
+
+.neutral {
+  border-color: var(--color-border-muted);
+}
+
+.error {
+  border-color: rgba(186, 58, 51, 0.24);
+  background: rgba(186, 58, 51, 0.06);
+}
+
+.success {
+  border-color: rgba(31, 143, 95, 0.24);
+  background: rgba(31, 143, 95, 0.08);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--font-size-18);
+}
+
+.message {
+  margin: 0;
+  color: var(--color-text-secondary);
+  line-height: 1.7;
+}
+
+.action {
+  display: flex;
+  gap: var(--space-3);
+}

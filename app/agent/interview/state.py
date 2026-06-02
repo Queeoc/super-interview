@@ -1,4 +1,4 @@
-"""Phase 5 文字面试工作流状态与辅助函数。"""
+"""面试工作流状态与辅助函数。"""
 
 from __future__ import annotations
 
@@ -6,10 +6,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, TypedDict
 
-from app.models.interview import (
-    InterviewQuestionSnapshot,
-    InterviewQuestionStatus,
-)
+from app.models.interview import InterviewQuestionSnapshot, InterviewQuestionStatus
 
 
 def utc_now_iso() -> str:
@@ -19,7 +16,7 @@ def utc_now_iso() -> str:
 
 
 class InterviewSkillContext(TypedDict):
-    """面试工作流依赖的 Skill 上下文。"""
+    """面试工作流依赖的 Skill 与简历上下文。"""
 
     skill_id: str
     display_name: str
@@ -28,19 +25,18 @@ class InterviewSkillContext(TypedDict):
     reference_markdown: str
     categories: list[dict[str, Any]]
     reference_files: list[str]
+    resume_markdown: str
+    resume_metadata: dict[str, Any]
 
 
 class InterviewState(TypedDict, total=False):
-    """面试工作流运行态。
-
-    说明：
-    - 仅保存可序列化字段，便于写入 Redis 和 session_context_json。
-    - questions 列表既包含主问题，也包含运行时生成的追问题。
-    """
+    """面试工作流运行态。"""
 
     session_id: str
     visitor_id: str | None
     resume_id: str | None
+    resume_markdown: str
+    resume_metadata: dict[str, Any]
     title: str | None
     language: str
     max_rounds: int
@@ -71,13 +67,17 @@ def build_initial_state(
     title: str | None,
     visitor_id: str | None,
     resume_id: str | None,
+    resume_markdown: str = "",
+    resume_metadata: dict[str, Any] | None = None,
 ) -> InterviewState:
-    """创建一个可直接进入初始化工作流的状态对象。"""
+    """创建可直接进入工作流的初始状态对象。"""
 
     return {
         "session_id": session_id,
         "visitor_id": visitor_id,
         "resume_id": resume_id,
+        "resume_markdown": resume_markdown,
+        "resume_metadata": deepcopy(resume_metadata or {}),
         "title": title,
         "language": language,
         "max_rounds": max_rounds,
@@ -101,19 +101,19 @@ def build_initial_state(
 
 
 def clone_state(state: InterviewState) -> InterviewState:
-    """深拷贝状态，避免节点内直接污染上游输入。"""
+    """深拷贝状态，避免工作流节点之间互相污染。"""
 
     return deepcopy(state)
 
 
 def serialize_state(state: InterviewState) -> dict[str, Any]:
-    """把状态转换为稳定的可 JSON 序列化字典。"""
+    """转换为稳定可 JSON 序列化的字典。"""
 
     return deepcopy(state)
 
 
 def normalize_question_snapshot(question: dict[str, Any] | InterviewQuestionSnapshot) -> dict[str, Any]:
-    """将题目快照统一转换为标准字典结构。"""
+    """统一题目快照结构。"""
 
     if isinstance(question, InterviewQuestionSnapshot):
         return question.model_dump(mode="json")
@@ -121,13 +121,13 @@ def normalize_question_snapshot(question: dict[str, Any] | InterviewQuestionSnap
 
 
 def list_questions(state: InterviewState) -> list[dict[str, Any]]:
-    """返回当前状态中的题目列表。"""
+    """返回当前状态中的所有题目。"""
 
     return [normalize_question_snapshot(question) for question in state.get("questions", [])]
 
 
 def get_current_question(state: InterviewState) -> dict[str, Any] | None:
-    """根据 current_question_key 读取当前题目快照。"""
+    """根据 current_question_key 读取当前题目。"""
 
     current_question_key = state.get("current_question_key")
     if not current_question_key:
@@ -140,7 +140,7 @@ def get_current_question(state: InterviewState) -> dict[str, Any] | None:
 
 
 def upsert_question(state: InterviewState, question: dict[str, Any] | InterviewQuestionSnapshot) -> None:
-    """向状态中追加或替换一个题目快照。"""
+    """插入或更新题目快照。"""
 
     normalized_question = normalize_question_snapshot(question)
     questions = list_questions(state)
@@ -155,7 +155,7 @@ def upsert_question(state: InterviewState, question: dict[str, Any] | InterviewQ
 
 
 def mark_question_asked(state: InterviewState, question_key: str) -> dict[str, Any] | None:
-    """把指定题目标记为已提问。"""
+    """将指定题目标记为已提问。"""
 
     questions = list_questions(state)
     for question in questions:
@@ -169,7 +169,7 @@ def mark_question_asked(state: InterviewState, question_key: str) -> dict[str, A
 
 
 def mark_question_answered(state: InterviewState, question_key: str) -> dict[str, Any] | None:
-    """把指定题目标记为已回答。"""
+    """将指定题目标记为已回答。"""
 
     questions = list_questions(state)
     for question in questions:
@@ -183,7 +183,7 @@ def mark_question_answered(state: InterviewState, question_key: str) -> dict[str
 
 
 def get_main_questions(state: InterviewState) -> list[dict[str, Any]]:
-    """返回所有主问题，并按轮次排序。"""
+    """返回所有主问题并排序。"""
 
     questions = [
         question
@@ -194,7 +194,7 @@ def get_main_questions(state: InterviewState) -> list[dict[str, Any]]:
 
 
 def get_follow_up_count_for_round(state: InterviewState, round_index: int) -> int:
-    """统计指定主问题轮次已生成的追问题数量。"""
+    """统计某一轮已经生成的追问数量。"""
 
     return sum(
         1
@@ -204,7 +204,7 @@ def get_follow_up_count_for_round(state: InterviewState, round_index: int) -> in
 
 
 def find_next_main_question(state: InterviewState) -> dict[str, Any] | None:
-    """查找下一条尚未提问的主问题。"""
+    """查找下一个尚未提问的主问题。"""
 
     current_round = state.get("current_round", 0)
     for question in get_main_questions(state):
@@ -215,7 +215,7 @@ def find_next_main_question(state: InterviewState) -> dict[str, Any] | None:
 
 
 def build_session_context_payload(state: InterviewState) -> dict[str, Any]:
-    """提取用于 session_context_json 的运行态快照。"""
+    """构建用于持久化的工作流状态快照。"""
 
     questions = list_questions(state)
     return {
@@ -227,6 +227,8 @@ def build_session_context_payload(state: InterviewState) -> dict[str, Any]:
             if not bool(question.get("is_follow_up"))
         ],
         "last_draft_answer": deepcopy(state.get("last_draft_answer", {})),
+        "resume_markdown": state.get("resume_markdown", ""),
+        "resume_metadata": deepcopy(state.get("resume_metadata", {})),
         "latest_feedback": deepcopy(state.get("feedback", {})),
         "next_action": state.get("next_action"),
         "action_reason": state.get("action_reason"),

@@ -38,6 +38,24 @@ async def create_interview_session(
     }
 
 
+@router.get("/interview/sessions")
+async def list_interview_sessions(
+    http_request: Request,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """列出当前匿名访客的历史面试会话。"""
+
+    result = await interview_service.list_sessions(
+        session,
+        visitor_id=get_request_visitor_id(http_request),
+    )
+    return {
+        "code": 200,
+        "message": "success",
+        "data": [item.model_dump(mode="json") for item in result],
+    }
+
+
 @router.get("/interview/sessions/{session_id}")
 async def get_interview_session(
     session_id: str,
@@ -140,7 +158,9 @@ async def submit_interview_answer(
                 ),
             }
 
-    return EventSourceResponse(event_generator())
+    # Some sse-starlette versions treat ping=0 as a tight heartbeat loop instead of disabling it.
+    # Use a long interval so short-lived interview streams emit only business JSON frames.
+    return EventSourceResponse(event_generator(), ping=60)
 
 
 @router.post("/interview/sessions/{session_id}/complete")

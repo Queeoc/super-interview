@@ -1,0 +1,111 @@
+.homeLayout {
+  display: grid;
+  gap: var(--space-5);
+}
+
+.cardGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: var(--space-4);
+}
+
+.featureCard {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-5);
+  border: 1px solid var(--color-border-muted);
+  border-radius: var(--radius-xl);
+  color: inherit;
+  text-align: left;
+  background: rgba(255, 255, 255, 0.78);
+  cursor: pointer;
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.featureCard:hover {
+  transform: translateY(-2px);
+  border-color: var(--color-brand-strong);
+  box-shadow: var(--shadow-soft);
+}
+
+.featureCardLabel {
+  font-size: var(--font-size-18);
+  font-weight: var(--font-weight-semibold);
+}
+
+.featureCardDescription {
+  color: var(--color-text-secondary);
+  line-height: 1.65;
+}
+
+.featureCardHint {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-14);
+}
+
+.statusGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  gap: var(--space-5);
+}
+
+.metricGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: var(--space-4);
+}
+
+.metricCard,
+.noteCard {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--color-border-muted);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.metricCard span,
+.noteCard span {
+  color: var(--color-text-secondary);
+  line-height: 1.65;
+}
+
+.secondaryButton {
+  padding: 0.85rem 1.15rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-xl);
+  background: rgba(255, 255, 255, 0.82);
+  cursor: pointer;
+}
+
+.noteList {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.inlineMeta {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border-radius: var(--radius-xl);
+  background: var(--color-surface-canvas);
+  border: 1px solid var(--color-border-muted);
+}
+
+.metaKey {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-13);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.metaValue {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-16);
+}

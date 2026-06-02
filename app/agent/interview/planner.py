@@ -93,6 +93,14 @@ class InterviewPlanner:
             "skill_description": skill["description"],
             "language": state["language"],
             "max_rounds": state["max_rounds"],
+            "resume_markdown": self._prompt_runner.wrap_untrusted_text(
+                "resume_markdown",
+                str(state.get("resume_markdown", "")),
+            ),
+            "resume_metadata": self._prompt_runner.wrap_untrusted_text(
+                "resume_metadata",
+                str(state.get("resume_metadata", {})),
+            ),
             "skill_markdown": self._prompt_runner.wrap_untrusted_text(
                 "skill_markdown",
                 skill["content_markdown"],

@@ -52,6 +52,7 @@ class InterviewReportStatus(str, Enum):
     """面试报告状态。"""
 
     PENDING = "pending"
+    PROCESSING = "processing"
     GENERATED = "generated"
     FAILED = "failed"
 
@@ -166,6 +167,10 @@ class InterviewSessionDTO(BaseModel):
         default_factory=list,
         description="当前会话题目快照列表",
     )
+    answers: list[InterviewAnswerHistoryDTO] = Field(
+        default_factory=list,
+        description="已提交的历史问答记录",
+    )
     answer_count: int = Field(default=0, ge=0, description="已提交答案数")
     follow_up_count: int = Field(default=0, ge=0, description="当前主问题追问次数")
     completed: bool = Field(default=False, description="是否已完成")
@@ -175,6 +180,30 @@ class InterviewSessionDTO(BaseModel):
         description="最近一次暂存答案快照",
     )
     started_at: datetime | None = Field(default=None, description="开始时间")
+    completed_at: datetime | None = Field(default=None, description="完成时间")
+
+
+class InterviewSessionSummaryDTO(BaseModel):
+    """面试会话列表使用的摘要 DTO。"""
+
+    session_id: str = Field(..., description="会话标识")
+    resume_id: str | None = Field(default=None, description="关联简历标识")
+    skill_id: str = Field(..., description="Skill 标识")
+    skill_display_name: str = Field(..., description="Skill 展示名称")
+    title: str | None = Field(default=None, description="会话标题")
+    language: str = Field(..., description="面试语言")
+    status: str = Field(..., description="会话状态")
+    current_round: int = Field(..., ge=0, description="当前主问题轮次")
+    max_rounds: int = Field(..., ge=1, description="最大主问题轮次")
+    answer_count: int = Field(default=0, ge=0, description="已提交答案数")
+    completed: bool = Field(default=False, description="是否已完成")
+    report_status: str | None = Field(default=None, description="报告状态")
+    current_question: InterviewQuestionSnapshot | None = Field(
+        default=None,
+        description="当前待回答题目快照",
+    )
+    started_at: datetime | None = Field(default=None, description="开始时间")
+    updated_at: datetime | None = Field(default=None, description="更新时间")
     completed_at: datetime | None = Field(default=None, description="完成时间")
 
 
@@ -193,6 +222,20 @@ class SubmitAnswerResponse(BaseModel):
     )
     feedback: dict[str, Any] = Field(default_factory=dict, description="过程状态或反馈信息")
     report_status: str | None = Field(default=None, description="报告状态")
+
+
+class InterviewAnswerHistoryDTO(BaseModel):
+    """会话页使用的历史问答快照。"""
+
+    answer_id: str = Field(..., description="答案记录标识")
+    round_index: int = Field(..., ge=1, description="所属轮次")
+    question_key: str | None = Field(default=None, description="题目标识")
+    question_text: str = Field(..., description="题目正文")
+    answer_text: str = Field(..., description="候选人回答")
+    answer_status: str = Field(..., description="答案状态")
+    submitted_at: datetime | None = Field(default=None, description="答案提交时间")
+    answer_metadata: dict[str, Any] = Field(default_factory=dict, description="答案附加元数据")
+    feedback: dict[str, Any] = Field(default_factory=dict, description="过程反馈")
 
 
 class InterviewQuestionEvaluationDTO(BaseModel):
@@ -232,6 +275,7 @@ class InterviewReportDTO(BaseModel):
     rubric_path: str | None = Field(default=None, description="评分基线路径")
     generation_mode: str = Field(default="fallback", description="报告生成模式")
     markdown_content: str = Field(default="", description="Markdown 报告内容")
+    message: str | None = Field(default=None, description="状态说明")
     error_message: str | None = Field(default=None, description="失败原因")
     generated_at: datetime | None = Field(default=None, description="生成时间")
 
@@ -391,6 +435,7 @@ class InterviewReportEntity(Base):
 
 __all__ = [
     "CreateInterviewRequest",
+    "InterviewAnswerHistoryDTO",
     "InterviewAnswerEntity",
     "InterviewAnswerStatus",
     "InterviewQuestionSnapshot",
@@ -398,6 +443,7 @@ __all__ = [
     "InterviewQuestionStatus",
     "InterviewReportEntity",
     "InterviewReportStatus",
+    "InterviewSessionSummaryDTO",
     "InterviewSessionDTO",
     "InterviewSessionEntity",
     "InterviewSessionStatus",

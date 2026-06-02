@@ -63,6 +63,22 @@ class ProviderRepository:
         result = await self._session.scalars(stmt)
         return list(result.all())
 
+    async def list_available_providers(
+        self,
+        *,
+        exclude_provider_codes: set[str] | None = None,
+        limit: int = 500,
+    ) -> list[LlmProviderEntity]:
+        """列出当前可用于自动切换的 Provider。"""
+
+        stmt = select(LlmProviderEntity).where(LlmProviderEntity.status == LlmProviderStatus.ACTIVE.value)
+        if exclude_provider_codes:
+            stmt = stmt.where(LlmProviderEntity.provider_code.notin_(sorted(exclude_provider_codes)))
+        stmt = stmt.order_by(desc(LlmProviderEntity.is_default), desc(LlmProviderEntity.updated_at))
+        stmt = stmt.limit(limit)
+        result = await self._session.scalars(stmt)
+        return list(result.all())
+
     async def get_default_provider(self) -> LlmProviderEntity | None:
         """查询默认 Provider。"""
 

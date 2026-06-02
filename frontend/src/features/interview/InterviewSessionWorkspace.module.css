@@ -1,0 +1,207 @@
+.layout {
+  display: grid;
+  gap: var(--space-5);
+}
+
+.mainColumn {
+  display: grid;
+  gap: var(--space-5);
+}
+
+.sessionContent,
+.reportSection {
+  display: grid;
+  gap: var(--space-6);
+}
+
+.snapshotGrid,
+.reportMetaGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: var(--space-4);
+}
+
+.snapshotCard,
+.dimensionCard {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border-radius: var(--radius-xl);
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.snapshotCard span,
+.dimensionCard span {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-13);
+}
+
+.chatTimeline {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.chatBubble {
+  display: grid;
+  gap: var(--space-3);
+  max-width: min(100%, 52rem);
+  padding: var(--space-5);
+  border-radius: 1.6rem;
+  border: 1px solid rgba(13, 18, 33, 0.08);
+  box-shadow: var(--shadow-sm);
+}
+
+.chatBubbleAssistant {
+  justify-self: start;
+  background: linear-gradient(180deg, rgba(255, 248, 238, 0.95), rgba(255, 255, 255, 0.92));
+}
+
+.chatBubbleUser {
+  justify-self: end;
+  background: linear-gradient(180deg, rgba(226, 239, 255, 0.96), rgba(244, 248, 255, 0.96));
+}
+
+.chatBubbleStreaming {
+  border-color: rgba(192, 75, 34, 0.25);
+  box-shadow: 0 0 0 1px rgba(192, 75, 34, 0.08), var(--shadow-sm);
+}
+
+.chatMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  align-items: center;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-13);
+}
+
+.chatMeta strong {
+  color: var(--color-text-primary);
+}
+
+.chatContent {
+  margin: 0;
+  font-size: var(--font-size-18);
+  line-height: 1.8;
+  white-space: pre-wrap;
+}
+
+.section {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.sectionTitle {
+  margin: 0;
+  font-size: var(--font-size-20);
+}
+
+.textarea {
+  width: 100%;
+  min-height: 12rem;
+  padding: 1rem 1rem 1.1rem;
+  border: 1px solid var(--color-border-muted);
+  border-radius: var(--radius-2xl);
+  background: rgba(255, 255, 255, 0.9);
+  resize: vertical;
+}
+
+.actionRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  justify-content: flex-end;
+}
+
+.primaryButton,
+.secondaryButton {
+  padding: 0.9rem 1.25rem;
+  border-radius: var(--radius-xl);
+  font-weight: var(--font-weight-semibold);
+  cursor: pointer;
+}
+
+.primaryButton {
+  border: 0;
+  background: var(--color-brand-strong);
+  color: white;
+}
+
+.secondaryButton {
+  border: 1px solid var(--color-border-strong);
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.primaryButton:disabled,
+.secondaryButton:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.streamSection {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.logList {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.logItem {
+  padding: var(--space-4);
+  border-radius: var(--radius-xl);
+  background: rgba(255, 255, 255, 0.74);
+  border: 1px solid var(--color-border-muted);
+}
+
+.reportSummaryGrid,
+.dimensionGrid,
+.questionEvaluationList {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.reportSummaryGrid {
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+}
+
+.reportListCard,
+.exportCard,
+.questionEvaluationCard {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-radius: var(--radius-xl);
+  background: rgba(255, 255, 255, 0.74);
+  border: 1px solid var(--color-border-muted);
+}
+
+.reportListCard h4,
+.questionEvaluationHeader {
+  margin: 0;
+}
+
+.reportListCard ul {
+  margin: 0;
+  padding-left: 1.2rem;
+  color: var(--color-text-secondary);
+}
+
+.questionEvaluationHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  align-items: center;
+}
+
+.questionEvaluationText,
+.questionEvaluationMeta {
+  margin: 0;
+}
+
+.questionEvaluationMeta,
+.exportCard span {
+  color: var(--color-text-secondary);
+  line-height: 1.6;
+}

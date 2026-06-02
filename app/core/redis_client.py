@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from loguru import logger
 from redis.asyncio import Redis
+from redis.exceptions import ResponseError
 
 from app.config import config
 
@@ -112,6 +114,96 @@ class RedisClientManager:
             approximate=True if maxlen else False,
         )
 
+    async def create_consumer_group(
+        self,
+        stream_name: str,
+        group_name: str,
+        *,
+        start_id: str = "$",
+        mkstream: bool = True,
+    ) -> bool:
+        """创建 Redis Stream consumer group。"""
+
+        try:
+            await self.get_client().xgroup_create(
+                name=self._build_key(stream_name),
+                groupname=group_name,
+                id=start_id,
+                mkstream=mkstream,
+            )
+            return True
+        except ResponseError as exc:
+            if "BUSYGROUP" in str(exc):
+                return False
+            raise
+
+    async def read_group_stream(
+        self,
+        group_name: str,
+        consumer_name: str,
+        streams: dict[str, str],
+        *,
+        count: int | None = None,
+        block_ms: int | None = None,
+    ) -> Any:
+        """以 consumer group 方式读取 Stream。"""
+
+        namespaced_streams = {
+            self._build_key(name): last_id for name, last_id in streams.items()
+        }
+        return await self.get_client().xreadgroup(
+            groupname=group_name,
+            consumername=consumer_name,
+            streams=namespaced_streams,
+            count=count,
+            block=block_ms,
+        )
+
+    async def acknowledge_stream_entries(
+        self,
+        stream_name: str,
+        group_name: str,
+        entry_ids: Iterable[str],
+    ) -> int:
+        """确认处理完成的 Stream 消息。"""
+
+        entry_id_list = list(entry_ids)
+        if not entry_id_list:
+            return 0
+        return int(
+            await self.get_client().xack(
+                self._build_key(stream_name),
+                group_name,
+                *entry_id_list,
+            )
+        )
+
+    async def auto_claim_stream_entries(
+        self,
+        stream_name: str,
+        group_name: str,
+        consumer_name: str,
+        *,
+        min_idle_ms: int,
+        start_id: str = "0-0",
+        count: int | None = None,
+    ) -> tuple[str, list[Any], list[str]]:
+        """认领长时间未处理的 pending Stream 消息。"""
+
+        return await self.get_client().xautoclaim(
+            name=self._build_key(stream_name),
+            groupname=group_name,
+            consumername=consumer_name,
+            min_idle_time=min_idle_ms,
+            start_id=start_id,
+            count=count,
+        )
+
+    async def get_group_info(self, stream_name: str) -> list[dict[str, Any]]:
+        """查询 Stream group 信息。"""
+
+        return list(await self.get_client().xinfo_groups(self._build_key(stream_name)))
+
     async def read_stream(
         self,
         streams: dict[str, str],
@@ -139,6 +231,16 @@ class RedisClientManager:
 
         return await self.get_client().eval(script, numkeys, *keys_and_args)
 
+    async def script_load(self, script: str) -> str:
+        """加载 Lua 脚本并返回 SHA。"""
+
+        return await self.get_client().script_load(script)
+
+    async def evalsha(self, sha: str, numkeys: int, *keys_and_args: Any) -> Any:
+        """按 SHA 执行 Lua 脚本。"""
+
+        return await self.get_client().evalsha(sha, numkeys, *keys_and_args)
+
     async def close(self) -> None:
         """Close the Redis client."""
 
@@ -154,6 +256,11 @@ class RedisClientManager:
         """Apply the configured key prefix to a logical key."""
 
         return f"{config.redis.key_prefix}:{key}"
+
+    def build_key(self, key: str) -> str:
+        """公开的带前缀 key 构造器。"""
+
+        return self._build_key(key)
 
 
 redis_manager = RedisClientManager()

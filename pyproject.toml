@@ -27,6 +27,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "langchain-milvus>=0.3.3",
     "langchain-text-splitters>=1.1.0",
+    "pymupdf4llm>=1.27.2.3",
     "langchain-mcp-adapters>=0.2.1",
     "fastmcp>=2.14.0",
     "langchain-qwq>=0.3.4",

@@ -70,7 +70,28 @@ class EvaluationService:
         if existing_report and existing_report.status == InterviewReportStatus.GENERATED.value:
             return existing_report
 
+        if existing_report and existing_report.status == InterviewReportStatus.PROCESSING.value:
+            logger.info(
+                "统一评估任务已在处理中，跳过重复生成: session_id={}",
+                session_id,
+            )
+            return existing_report
+
         report_entity = existing_report or InterviewReportEntity(session_id=session_id)
+        report_entity.status = InterviewReportStatus.PROCESSING.value
+        report_entity.summary_text = "统一评估进行中，请稍后刷新查看结果。"
+        report_entity.report_json = {
+            "session_id": session_id,
+            "skill_id": interview_session.skill_id or "",
+            "status": InterviewReportStatus.PROCESSING.value,
+            "message": "统一评估进行中，请稍后刷新查看结果。",
+        }
+        report_entity.score_json = {
+            "status": InterviewReportStatus.PROCESSING.value,
+            "message": "统一评估进行中，请稍后刷新查看结果。",
+        }
+        report_entity.error_message = None
+        report_entity = await repository.upsert_report(report_entity)
         try:
             report_dto = await self._build_generated_report(
                 interview_session=interview_session,
@@ -104,7 +125,7 @@ class EvaluationService:
             report_entity.error_message = str(exc)
             report_entity.generated_at = None
 
-        await repository.upsert_report(report_entity)
+        report_entity = await repository.upsert_report(report_entity)
         return report_entity
 
     async def get_report(
@@ -245,6 +266,7 @@ class EvaluationService:
                 rubric_path=None,
                 generation_mode="pending",
                 markdown_content=self._build_pending_markdown(interview_session),
+                message="面试尚未完成，正式评估报告将在完成后统一生成。",
                 error_message=None,
                 generated_at=None,
             )
@@ -274,6 +296,7 @@ class EvaluationService:
                 rubric_path=self._coerce_optional_string(report_json.get("rubric_path")),
                 generation_mode=self._coerce_optional_string(report_json.get("generation_mode")) or "fallback",
                 markdown_content=str(report_json.get("markdown_content", "")),
+                message=self._coerce_optional_string(report_json.get("message")),
                 error_message=report.error_message,
                 generated_at=report.generated_at,
             )
@@ -298,8 +321,9 @@ class EvaluationService:
             question_evaluations=question_evaluations,
             rubric_name=self._coerce_optional_string(report_json.get("rubric_name")),
             rubric_path=self._coerce_optional_string(report_json.get("rubric_path")),
-            generation_mode="pending",
+            generation_mode=report.status,
             markdown_content=self._build_pending_markdown(interview_session),
+            message=self._coerce_optional_string(report_json.get("message")) or "报告正在生成中，请稍后刷新。",
             error_message=report.error_message,
             generated_at=None,
         )
@@ -333,6 +357,7 @@ class EvaluationService:
                 f"- skill_id: {interview_session.skill_id or 'unknown'}\n"
                 f"- error: {error_message}\n"
             ),
+            message="统一评估未能完成，请稍后重试或查看错误信息。",
             error_message=error_message,
             generated_at=None,
         )

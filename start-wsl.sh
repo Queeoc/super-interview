@@ -10,8 +10,10 @@ echo "  super-interview 服务启动 (WSL)"
 echo "===================================="
 echo ""
 
+FRONTEND_PORT=5173
+
 # ── Step 1: Activate conda ──────────────────────────────────
-echo "[1/5] 激活 Conda 环境..."
+echo "[1/6] 激活 Conda 环境..."
 
 # Locate conda
 if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
@@ -36,7 +38,7 @@ echo "[成功] Conda 环境已激活: $CONDA_ENV_NAME"
 echo ""
 
 # ── Step 2: Start Docker ────────────────────────────────────
-echo "[2/5] 检查 Docker..."
+echo "[2/6] 检查 Docker..."
 
 if ! docker info >/dev/null 2>&1; then
     echo "[信息] Docker 未运行，尝试启动..."
@@ -51,7 +53,7 @@ echo "[成功] Docker 运行中"
 echo ""
 
 # ── Step 3: Start infrastructure stack ──────────────────────
-echo "[3/5] 启动开发基础设施 (PostgreSQL / Redis / Milvus)..."
+echo "[3/6] 启动开发基础设施 (PostgreSQL / Redis / Milvus)..."
 
 cd "$SCRIPT_DIR"
 
@@ -72,7 +74,7 @@ echo "[成功] 开发基础设施就绪"
 echo ""
 
 # ── Step 4: Start MCP services ──────────────────────────────
-echo "[4/5] 启动 MCP 服务..."
+echo "[4/6] 启动 MCP 服务..."
 
 # CLS MCP
 if pgrep -f "mcp_servers/cls_server.py" >/dev/null 2>&1; then
@@ -92,7 +94,7 @@ fi
 echo ""
 
 # ── Step 5: Start FastAPI ───────────────────────────────────
-echo "[5/5] 启动 FastAPI 服务..."
+echo "[5/6] 启动 FastAPI 服务..."
 
 # Kill old uvicorn if running
 pkill -f "uvicorn app.main:app" 2>/dev/null || true
@@ -113,6 +115,47 @@ for i in $(seq 1 30); do
 done
 echo ""
 
+# ── Step 6: Start Frontend ──────────────────────────────────
+echo "[6/6] 启动前端 Vite 服务..."
+
+if [ ! -f "$SCRIPT_DIR/frontend/package.json" ]; then
+    echo "[错误] 未找到 frontend/package.json，无法启动前端"
+    exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    echo "[错误] 未找到 node/npm，请先在 WSL 中安装前端运行环境"
+    exit 1
+fi
+
+if [ ! -d "$SCRIPT_DIR/frontend/node_modules" ]; then
+    echo "[错误] 未找到 frontend/node_modules，请先执行:"
+    echo "        cd frontend && npm install"
+    exit 1
+fi
+
+if pgrep -f "vite --host 0.0.0.0 --port ${FRONTEND_PORT}" >/dev/null 2>&1; then
+    echo "[信息] 前端 Vite 服务已在运行"
+else
+    rm -f "$SCRIPT_DIR/frontend.pid"
+    (
+        cd "$SCRIPT_DIR/frontend"
+        nohup npm run dev -- --host 0.0.0.0 --port "${FRONTEND_PORT}" > "$SCRIPT_DIR/frontend.log" 2>&1 &
+        echo $! > "$SCRIPT_DIR/frontend.pid"
+    )
+    echo "[成功] 前端 Vite 已启动 (PID: $(cat "$SCRIPT_DIR/frontend.pid"))"
+    echo "[信息] 等待前端服务就绪..."
+
+    for i in $(seq 1 30); do
+        if curl -s "http://localhost:${FRONTEND_PORT}" >/dev/null 2>&1; then
+            echo "[成功] 前端服务运行正常"
+            break
+        fi
+        sleep 1
+    done
+fi
+echo ""
+
 # ── Upload docs ─────────────────────────────────────────────
 # echo "[上传] 上传文档到向量数据库..."
 # for f in aiops-docs/*.md; do
@@ -131,16 +174,19 @@ echo "  服务启动完成！"
 echo "===================================="
 echo ""
 echo "  Windows 访问地址:"
+echo "    Frontend: http://${WSL_IP}:${FRONTEND_PORT}"
 echo "    Web:     http://${WSL_IP}:9900"
 echo "    API文档: http://${WSL_IP}:9900/docs"
 echo "    Milvus:  http://${WSL_IP}:8000"
 echo "    Redis:   ${WSL_IP}:6379"
 echo "    Postgres:${WSL_IP}:5432"
 echo ""
+echo "  WSL 内前端: http://localhost:${FRONTEND_PORT}"
 echo "  WSL 内访问: http://localhost:9900"
 echo "  Conda env:  conda activate $CONDA_ENV_NAME"
 echo ""
 echo "  日志:"
+echo "    Frontend: tail -f frontend.log"
 echo "    FastAPI : tail -f server.log"
 echo "    CLS MCP : tail -f mcp_cls.log"
 echo "    Monitor : tail -f mcp_monitor.log"

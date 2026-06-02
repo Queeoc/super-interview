@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from app.config import config

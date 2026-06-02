@@ -106,6 +106,8 @@ class InterviewExecutor:
             skill=skill,
             current_question=current_question,
             answer_text=state.get("latest_answer_text", ""),
+            resume_markdown=str(state.get("resume_markdown", "")),
+            resume_metadata=state.get("resume_metadata", {}),
         )
         follow_up_question = InterviewQuestionSnapshot(
             question_key=follow_up_key,
@@ -161,11 +163,27 @@ class InterviewExecutor:
         skill: dict[str, Any],
         current_question: dict[str, Any],
         answer_text: str,
+        resume_markdown: str | None = None,
+        resume_metadata: dict[str, Any] | None = None,
     ) -> str:
         """优先借助 LLM 生成追问。"""
 
+        resume_markdown_text = (
+            resume_markdown if resume_markdown is not None else str(skill.get("resume_markdown", ""))
+        )
+        resume_metadata_value = (
+            resume_metadata if resume_metadata is not None else skill.get("resume_metadata", {})
+        )
         variables = {
             "skill_name": skill["display_name"],
+            "resume_markdown": self._prompt_runner.wrap_untrusted_text(
+                "resume_markdown",
+                str(resume_markdown_text),
+            ),
+            "resume_metadata": self._prompt_runner.wrap_untrusted_text(
+                "resume_metadata",
+                str(resume_metadata_value),
+            ),
             "skill_markdown": self._prompt_runner.wrap_untrusted_text(
                 "skill_markdown",
                 skill["content_markdown"],

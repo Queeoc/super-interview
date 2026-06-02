@@ -74,6 +74,11 @@ htmlcov/
 
 # Build artifacts
 super_biz_agent_py.egg-info/
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/.vitest/
+frontend/.vite/
 
 # MyPy
 .mypy_cache/
@@ -85,3 +90,4 @@ dmypy.json
 
 # Local notes
 问题及解决方式/
+ai生成记录/

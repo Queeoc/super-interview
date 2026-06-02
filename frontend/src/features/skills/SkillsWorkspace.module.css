@@ -1,0 +1,143 @@
+.layout {
+  display: grid;
+  grid-template-columns: minmax(18rem, 24rem) 1fr;
+  gap: var(--space-5);
+  align-items: start;
+}
+
+.layout > :first-child {
+  position: sticky;
+  top: var(--space-5);
+  align-self: start;
+  max-height: calc(100vh - var(--space-10));
+  overflow-y: auto;
+}
+
+.list {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.listButton {
+  display: grid;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-4);
+  border: 1px solid var(--color-border-muted);
+  border-radius: var(--radius-xl);
+  background: rgba(255, 255, 255, 0.72);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.listButton:hover {
+  transform: translateY(-1px);
+  border-color: var(--color-accent-strong);
+  box-shadow: var(--shadow-soft);
+}
+
+.listButtonActive {
+  border-color: var(--color-brand-strong);
+  background: rgba(255, 250, 241, 0.96);
+}
+
+.listButtonTitle {
+  font-size: var(--font-size-18);
+  font-weight: var(--font-weight-semibold);
+}
+
+.listButtonDescription,
+.listButtonMeta {
+  color: var(--color-text-secondary);
+  line-height: 1.6;
+}
+
+.listButtonMeta {
+  font-size: var(--font-size-14);
+}
+
+.detail {
+  display: grid;
+  gap: var(--space-6);
+  align-content: start;
+  min-width: 0;
+}
+
+.metaSection {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: var(--space-4);
+}
+
+.metaSection > div {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border-radius: var(--radius-xl);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.metaLabel {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-13);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.section {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.sectionTitle {
+  margin: 0;
+  font-size: var(--font-size-20);
+}
+
+.tagGrid,
+.referenceList {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.tagCard,
+.referenceCard {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--color-border-muted);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.tagCard span,
+.referenceCard span {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-14);
+}
+
+.preformatted {
+  margin: 0;
+  overflow-x: auto;
+  padding: var(--space-5);
+  border-radius: var(--radius-xl);
+  background: #17202d;
+  color: #f3f5f8;
+}
+
+@media (max-width: 1080px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .layout > :first-child {
+    position: static;
+    top: auto;
+    max-height: none;
+    overflow-y: visible;
+  }
+}

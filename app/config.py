@@ -269,6 +269,165 @@ class RedisSettings(SectionSettings):
         return f"redis://{self.host}:{self.port}/{self.db}"
 
 
+class RateLimitSettings(SectionSettings):
+    """限流配置。"""
+
+    enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("RATE_LIMIT__ENABLED", "RATE_LIMIT_ENABLED"),
+    )
+    window_seconds: int = Field(
+        default=60,
+        validation_alias=AliasChoices("RATE_LIMIT__WINDOW_SECONDS", "RATE_LIMIT_WINDOW_SECONDS"),
+    )
+    read_global_limit: int = Field(
+        default=1200,
+        validation_alias=AliasChoices(
+            "RATE_LIMIT__READ_GLOBAL_LIMIT",
+            "RATE_LIMIT_READ_GLOBAL_LIMIT",
+        ),
+    )
+    read_ip_limit: int = Field(
+        default=240,
+        validation_alias=AliasChoices("RATE_LIMIT__READ_IP_LIMIT", "RATE_LIMIT_READ_IP_LIMIT"),
+    )
+    read_user_limit: int = Field(
+        default=120,
+        validation_alias=AliasChoices("RATE_LIMIT__READ_USER_LIMIT", "RATE_LIMIT_READ_USER_LIMIT"),
+    )
+    write_global_limit: int = Field(
+        default=600,
+        validation_alias=AliasChoices(
+            "RATE_LIMIT__WRITE_GLOBAL_LIMIT",
+            "RATE_LIMIT_WRITE_GLOBAL_LIMIT",
+        ),
+    )
+    write_ip_limit: int = Field(
+        default=120,
+        validation_alias=AliasChoices("RATE_LIMIT__WRITE_IP_LIMIT", "RATE_LIMIT_WRITE_IP_LIMIT"),
+    )
+    write_user_limit: int = Field(
+        default=60,
+        validation_alias=AliasChoices("RATE_LIMIT__WRITE_USER_LIMIT", "RATE_LIMIT_WRITE_USER_LIMIT"),
+    )
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def normalize_enabled(cls, value: Any) -> Any:
+        return _coerce_boolish(value)
+
+
+class StreamTaskSettings(SectionSettings):
+    """Redis Stream 异步任务配置。"""
+
+    enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("STREAM_TASK__ENABLED", "STREAM_TASK_ENABLED"),
+    )
+    stream_name: str = Field(
+        default="async_tasks",
+        validation_alias=AliasChoices("STREAM_TASK__STREAM_NAME", "STREAM_TASK_STREAM_NAME"),
+    )
+    dead_letter_stream_name: str = Field(
+        default="async_tasks_dead_letter",
+        validation_alias=AliasChoices(
+            "STREAM_TASK__DEAD_LETTER_STREAM_NAME",
+            "STREAM_TASK_DEAD_LETTER_STREAM_NAME",
+        ),
+    )
+    status_key_prefix: str = Field(
+        default="async_task:status",
+        validation_alias=AliasChoices(
+            "STREAM_TASK__STATUS_KEY_PREFIX",
+            "STREAM_TASK_STATUS_KEY_PREFIX",
+        ),
+    )
+    consumer_group: str = Field(
+        default="biz-agent",
+        validation_alias=AliasChoices(
+            "STREAM_TASK__CONSUMER_GROUP",
+            "STREAM_TASK_CONSUMER_GROUP",
+        ),
+    )
+    consumer_name_prefix: str = Field(
+        default="worker",
+        validation_alias=AliasChoices(
+            "STREAM_TASK__CONSUMER_NAME_PREFIX",
+            "STREAM_TASK_CONSUMER_NAME_PREFIX",
+        ),
+    )
+    read_count: int = Field(
+        default=10,
+        validation_alias=AliasChoices("STREAM_TASK__READ_COUNT", "STREAM_TASK_READ_COUNT"),
+    )
+    block_ms: int = Field(
+        default=1000,
+        validation_alias=AliasChoices("STREAM_TASK__BLOCK_MS", "STREAM_TASK_BLOCK_MS"),
+    )
+    claim_idle_ms: int = Field(
+        default=60000,
+        validation_alias=AliasChoices("STREAM_TASK__CLAIM_IDLE_MS", "STREAM_TASK_CLAIM_IDLE_MS"),
+    )
+    max_retries: int = Field(
+        default=3,
+        validation_alias=AliasChoices("STREAM_TASK__MAX_RETRIES", "STREAM_TASK_MAX_RETRIES"),
+    )
+    maxlen: int = Field(
+        default=5000,
+        validation_alias=AliasChoices("STREAM_TASK__MAXLEN", "STREAM_TASK_MAXLEN"),
+    )
+    worker_poll_interval_seconds: float = Field(
+        default=1.0,
+        validation_alias=AliasChoices(
+            "STREAM_TASK__WORKER_POLL_INTERVAL_SECONDS",
+            "STREAM_TASK_WORKER_POLL_INTERVAL_SECONDS",
+        ),
+    )
+    synchronous_fallback_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "STREAM_TASK__SYNCHRONOUS_FALLBACK_ENABLED",
+            "STREAM_TASK_SYNCHRONOUS_FALLBACK_ENABLED",
+        ),
+    )
+
+    @field_validator("enabled", "synchronous_fallback_enabled", mode="before")
+    @classmethod
+    def normalize_switches(cls, value: Any) -> Any:
+        return _coerce_boolish(value)
+
+
+class ProviderRuntimeSettings(SectionSettings):
+    """Provider 运行时策略配置。"""
+
+    prefer_database_default: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "PROVIDER_RUNTIME__PREFER_DATABASE_DEFAULT",
+            "PROVIDER_RUNTIME_PREFER_DATABASE_DEFAULT",
+        ),
+    )
+    env_fallback_provider_code: str = Field(
+        default="env-default",
+        validation_alias=AliasChoices(
+            "PROVIDER_RUNTIME__ENV_FALLBACK_PROVIDER_CODE",
+            "PROVIDER_RUNTIME_ENV_FALLBACK_PROVIDER_CODE",
+        ),
+    )
+    env_fallback_provider_name: str = Field(
+        default="Environment Default Provider",
+        validation_alias=AliasChoices(
+            "PROVIDER_RUNTIME__ENV_FALLBACK_PROVIDER_NAME",
+            "PROVIDER_RUNTIME_ENV_FALLBACK_PROVIDER_NAME",
+        ),
+    )
+
+    @field_validator("prefer_database_default", mode="before")
+    @classmethod
+    def normalize_prefer_database_default(cls, value: Any) -> Any:
+        return _coerce_boolish(value)
+
+
 class StorageSettings(SectionSettings):
     """Placeholder object storage settings for later phases."""
 
@@ -483,6 +642,9 @@ class Settings(BaseModel):
     milvus: MilvusSettings = Field(default_factory=MilvusSettings)
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
+    rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
+    stream_task: StreamTaskSettings = Field(default_factory=StreamTaskSettings)
+    provider_runtime: ProviderRuntimeSettings = Field(default_factory=ProviderRuntimeSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     interview: InterviewSettings = Field(default_factory=InterviewSettings)
     skill: SkillSettings = Field(default_factory=SkillSettings)
@@ -588,6 +750,18 @@ class Settings(BaseModel):
     @property
     def mcp_servers(self) -> dict[str, dict[str, Any]]:
         return self.mcp.servers
+
+    @property
+    def rate_limit_enabled(self) -> bool:
+        return self.rate_limit.enabled
+
+    @property
+    def stream_task_enabled(self) -> bool:
+        return self.stream_task.enabled
+
+    @property
+    def provider_runtime_prefer_database_default(self) -> bool:
+        return self.provider_runtime.prefer_database_default
 
 
 config = Settings()

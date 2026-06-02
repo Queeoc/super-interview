@@ -27,6 +27,7 @@ from app.models.interview import (
     CreateInterviewRequest,
     InterviewAnswerEntity,
     InterviewReportEntity,
+    InterviewReportStatus,
     InterviewSessionEntity,
     SubmitAnswerRequest,
 )
@@ -57,6 +58,19 @@ class _InMemoryRedisBackend:
         return 1
 
 
+class _NullResumeService:
+    """测试用简历桩，默认不注入任何简历上下文。"""
+
+    async def resolve_resume_for_interview(
+        self,
+        session: Any,
+        *,
+        visitor_id: str,
+        resume_id: str | None,
+    ) -> None:
+        return None
+
+
 class _InMemoryInterviewRepository:
     """测试用面试仓储，绕过真实数据库。"""
 
@@ -79,6 +93,15 @@ class _InMemoryInterviewRepository:
 
     async def get_session(self, session_id: str) -> InterviewSessionEntity | None:
         return self.sessions.get(session_id)
+
+    async def list_sessions_by_visitor(
+        self,
+        visitor_id: str,
+        limit: int = 20,
+    ) -> list[InterviewSessionEntity]:
+        sessions = [session for session in self.sessions.values() if session.visitor_id == visitor_id]
+        sessions.sort(key=lambda item: item.updated_at or item.created_at, reverse=True)
+        return sessions[:limit]
 
     async def add_answer(self, entity: InterviewAnswerEntity) -> InterviewAnswerEntity:
         if not entity.id:
@@ -122,6 +145,7 @@ def _build_test_service() -> tuple[InterviewService, _InMemoryInterviewRepositor
     service = InterviewService(
         skill_service=SkillService(),
         persistence_service=InterviewPersistenceService(repository=repository),
+        resume_service=_NullResumeService(),
         repository_factory=lambda _session: repository,
         prompt_runner=prompt_runner,
         planner=InterviewPlanner(prompt_runner),
@@ -719,6 +743,93 @@ def test_interview_api_supports_create_and_sse_submit(
     assert create_response.headers.get("set-cookie")
 
 
+def test_interview_api_lists_sessions_for_current_visitor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """API 应支持列出当前访客的历史面试会话摘要。"""
+
+    service, _, session, _ = _build_test_service()
+    client = _build_api_client(monkeypatch, service, session)
+
+    first_response = client.post(
+        "/api/interview/sessions",
+        json={"skill_id": "python-backend", "max_rounds": 2},
+    )
+    second_response = client.post(
+        "/api/interview/sessions",
+        json={"skill_id": "python-backend", "max_rounds": 1, "title": "第二场面试"},
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+
+    list_response = client.get("/api/interview/sessions")
+
+    assert list_response.status_code == 200
+    payload = list_response.json()["data"]
+    assert len(payload) == 2
+    assert payload[0]["session_id"] == second_response.json()["data"]["session_id"]
+    assert payload[0]["title"] == "第二场面试"
+    assert payload[0]["skill_display_name"] == "Python 后端开发"
+    assert payload[0]["current_question"]["question_key"] == "q-1"
+
+
+def test_interview_api_does_not_auto_attach_resume_when_resume_id_is_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """未显式传入 resume_id 时，创建的面试会话不应自动关联任何简历。"""
+
+    service, _, session, _ = _build_test_service()
+    client = _build_api_client(monkeypatch, service, session)
+
+    create_response = client.post(
+        "/api/interview/sessions",
+        json={"skill_id": "python-backend", "max_rounds": 1, "resume_id": None},
+    )
+
+    assert create_response.status_code == 200
+    assert create_response.json()["data"]["resume_id"] is None
+
+
+def test_interview_api_sse_frames_are_all_json_business_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """确认面试 SSE 只返回可被前端直接 JSON.parse 的业务事件帧。"""
+
+    service, _, session, _ = _build_test_service()
+    client = _build_api_client(monkeypatch, service, session)
+
+    create_response = client.post(
+        "/api/interview/sessions",
+        json={"skill_id": "python-backend", "max_rounds": 2},
+    )
+    assert create_response.status_code == 200
+    session_id = create_response.json()["data"]["session_id"]
+
+    with client.stream(
+        "POST",
+        f"/api/interview/sessions/{session_id}/answers",
+        json={
+            "answer_text": (
+                "我会先说明缓存目标，再结合热点数据、一致性要求和失效策略设计 Redis 方案，"
+                "同时补充持久化、监控告警和故障降级处理。"
+            )
+        },
+    ) as response:
+        assert response.status_code == 200
+        raw_lines = [line for line in response.iter_lines()]
+
+    non_empty_lines = [line for line in raw_lines if line]
+    assert non_empty_lines, "SSE 不应返回空结果"
+    assert all(not line.startswith(":") for line in non_empty_lines), non_empty_lines
+
+    data_lines = [line for line in non_empty_lines if line.startswith("data: ")]
+    assert data_lines, non_empty_lines
+
+    payloads = [json.loads(line.removeprefix("data: ")) for line in data_lines]
+    assert all(isinstance(item, dict) and isinstance(item.get("type"), str) for item in payloads)
+
+
 def test_interview_api_returns_domain_error_for_unknown_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -811,3 +922,43 @@ def test_interview_api_supports_report_query_and_export(
     assert export_response.status_code == 200
     assert export_response.json()["data"]["export_format"] == "markdown"
     assert "# 面试评估报告" in export_response.json()["data"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_interview_service_does_not_fallback_to_sync_after_async_publish_succeeds() -> None:
+    """异步任务发布成功后，即使状态持久化失败，也不应再回退同步执行。"""
+
+    service, repository, session, _ = _build_test_service()
+    created = await service.create_session(
+        session,
+        CreateInterviewRequest(skill_id="python-backend", max_rounds=1),
+        TEST_VISITOR_ID,
+    )
+    report_entity = InterviewReportEntity(
+        session_id=created.session_id,
+        status=InterviewReportStatus.PENDING.value,
+        report_json={"status": "pending"},
+        score_json={"status": "pending"},
+    )
+    repository.reports[created.session_id] = report_entity
+
+    async def _raise_on_save_report(*args: Any, **kwargs: Any) -> InterviewReportEntity:
+        raise RuntimeError("db write failed after publish")
+
+    service._stream_producer.publish = AsyncMock(return_value="1-0")  # type: ignore[method-assign]
+    service._persistence_service.save_report = AsyncMock(side_effect=_raise_on_save_report)  # type: ignore[method-assign]
+    service._evaluation_service.generate_report = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="db write failed after publish"):
+        await service._schedule_or_generate_report(
+            session,
+            session_id=created.session_id,
+            interview_session=repository.sessions[created.session_id],
+            state={
+                "completion_message": "completed",
+            },
+            existing_report=report_entity,
+        )
+
+    service._stream_producer.publish.assert_awaited_once()
+    service._evaluation_service.generate_report.assert_not_awaited()

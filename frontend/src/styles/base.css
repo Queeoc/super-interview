@@ -1,0 +1,31 @@
+body {
+  min-width: 320px;
+  background: var(--color-surface-canvas);
+  color: var(--color-text-primary);
+  font-family: var(--font-family-base);
+  line-height: 1.5;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: var(--font-family-heading);
+  font-weight: var(--font-weight-bold);
+}
+
+code {
+  font-family: var(--font-family-mono);
+}
+
+::selection {
+  background: rgba(192, 75, 34, 0.18);
+}

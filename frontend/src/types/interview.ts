@@ -78,6 +78,36 @@ export type InterviewAnswerHistoryDto = {
   feedback: Record<string, unknown>;
 };
 
+export type InterviewProcessStepStatus = 'pending' | 'active' | 'completed' | 'skipped' | 'failed';
+
+export type InterviewProcessToolSummary = {
+  name?: string;
+  display_name?: string;
+  source?: string;
+  summary?: string;
+  matched_files?: string[];
+  matched_projects?: string[];
+  matched_skills?: string[];
+  retrieval_reason?: string | null;
+};
+
+export type InterviewProcessStepDto = {
+  id: string;
+  label: string;
+  detail?: string;
+  status: InterviewProcessStepStatus;
+  tool_summary?: InterviewProcessToolSummary;
+  timestamp: number;
+};
+
+export type InterviewProcessRunDto = {
+  id: string;
+  question_key: string | null;
+  round_index: number;
+  status: 'running' | 'completed' | 'failed';
+  steps: InterviewProcessStepDto[];
+};
+
 export type SubmitAnswerResponse = {
   session_id: string;
   action: string;
@@ -137,6 +167,19 @@ export type InterviewStatusEvent = {
   type: 'status';
   session_id: string;
   message: string;
+  stage?: string;
+  label?: string;
+  detail?: string;
+  tool?: {
+    name?: string;
+    display_name?: string;
+    source?: string;
+    summary?: string;
+    matched_files?: string[];
+    matched_projects?: string[];
+    matched_skills?: string[];
+    retrieval_reason?: string | null;
+  };
 };
 
 export type InterviewPlanEvent = {

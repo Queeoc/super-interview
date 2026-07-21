@@ -100,6 +100,8 @@ class RagService:
         query: str,
         knowledge_base_id: str | None = None,
         knowledge_base_ids: Sequence[str] | None = None,
+        skill_id: str | None = None,
+        include_global_skill: bool = True,
         category: str | None = None,
         top_k: int | None = None,
         score_threshold: float | None = None,
@@ -112,6 +114,8 @@ class RagService:
             query: 用户检索问题
             knowledge_base_id: 单个知识库 ID
             knowledge_base_ids: 多知识库联合检索 ID 列表
+            skill_id: 可选 skill 过滤
+            include_global_skill: 是否同时召回通用资料
             category: 可选分类
             top_k: 可选返回数量
             score_threshold: 可选分数阈值
@@ -150,6 +154,8 @@ class RagService:
                 top_k=resolved_top_k,
                 score_threshold=resolved_score_threshold,
                 knowledge_base_ids=normalized_knowledge_base_ids or None,
+                skill_id=skill_id.strip() if skill_id else None,
+                include_global_skill=include_global_skill,
                 category=category.strip() if category else None,
             )
         except Exception as exc:

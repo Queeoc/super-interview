@@ -24,10 +24,8 @@ _PROTECTED_PREFIXES = (
 
 _EXCLUDED_PREFIXES = (
     "/health",
-    "/static",
     "/api/chat",
     "/api/chat_stream",
-    "/api/aiops",
 )
 
 

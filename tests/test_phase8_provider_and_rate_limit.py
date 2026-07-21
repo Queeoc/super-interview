@@ -133,6 +133,11 @@ class _QuotaAwareChatModel:
         return f"ok-from-{self._provider_code}"
 
 
+class _ChatOpenAISpy:
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+
 class _FakeRedisForRateLimit:
     def __init__(self) -> None:
         self.enabled = True
@@ -348,6 +353,82 @@ def test_llm_factory_falls_back_to_env_runtime() -> None:
 
     assert provider.source == "env"
     assert provider.provider_code
+
+
+def test_llm_factory_forces_disable_thinking_for_non_streaming_dashscope_qwen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DashScope/Qwen 非流式调用应自动关闭 thinking，避免结构化输出报参数错误。"""
+
+    provider_runtime_registry.reset()
+    provider_runtime_registry.load_runtime_providers(
+        [
+            ProviderRuntimeRecord(
+                provider_code="qwen3-32b",
+                provider_name="Qwen 3 32B",
+                provider_type="chat",
+                api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                model_name="qwen3-32b",
+                api_key="sk-qwen",
+                settings_json={"extra_body": {"enable_thinking": True}},
+                source="database",
+                status="active",
+                is_default=True,
+            )
+        ],
+        default_provider_code="qwen3-32b",
+    )
+    captured: dict[str, Any] = {}
+
+    def _spy_chat_openai(**kwargs: Any) -> _ChatOpenAISpy:
+        captured.update(kwargs)
+        return _ChatOpenAISpy(**kwargs)
+
+    monkeypatch.setattr("app.core.llm_factory.ChatOpenAI", _spy_chat_openai)
+
+    llm_factory._build_chat_model(provider_code="qwen3-32b", streaming=False)
+
+    assert captured["streaming"] is False
+    assert captured["extra_body"]["stream"] is False
+    assert captured["extra_body"]["enable_thinking"] is False
+
+
+def test_llm_factory_keeps_streaming_thinking_for_dashscope_qwen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """流式问答链路应保留 provider 的 thinking 配置。"""
+
+    provider_runtime_registry.reset()
+    provider_runtime_registry.load_runtime_providers(
+        [
+            ProviderRuntimeRecord(
+                provider_code="qwen3-32b",
+                provider_name="Qwen 3 32B",
+                provider_type="chat",
+                api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                model_name="qwen3-32b",
+                api_key="sk-qwen",
+                settings_json={"extra_body": {"enable_thinking": True}},
+                source="database",
+                status="active",
+                is_default=True,
+            )
+        ],
+        default_provider_code="qwen3-32b",
+    )
+    captured: dict[str, Any] = {}
+
+    def _spy_chat_openai(**kwargs: Any) -> _ChatOpenAISpy:
+        captured.update(kwargs)
+        return _ChatOpenAISpy(**kwargs)
+
+    monkeypatch.setattr("app.core.llm_factory.ChatOpenAI", _spy_chat_openai)
+
+    llm_factory._build_chat_model(provider_code="qwen3-32b", streaming=True)
+
+    assert captured["streaming"] is True
+    assert captured["extra_body"]["stream"] is True
+    assert captured["extra_body"]["enable_thinking"] is True
 
 
 def test_rate_limit_middleware_blocks_when_limit_reached(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -192,7 +192,8 @@ class EvaluationService:
         skill_markdown = str(metadata.get("skill_markdown", ""))
         reference_markdown = str(metadata.get("reference_markdown", ""))
         rubric_name, rubric_path, rubric_markdown = self._load_rubric(interview_session.skill_id or "")
-        question_items = self._build_question_items(answers)
+        question_items = self._build_question_items(interview_session, answers)
+        question_groups = self._build_question_groups(question_items)
 
         question_evaluations = await self._batch_evaluator.evaluate_questions(
             skill_name=skill_name,
@@ -207,12 +208,14 @@ class EvaluationService:
             reference_markdown=reference_markdown,
             rubric_markdown=rubric_markdown,
             question_evaluations=question_evaluations,
+            question_groups=question_groups,
         )
         generation_mode = self._merge_generation_mode(question_evaluations, summary.get("generation_mode", "fallback"))
         markdown_content = self._build_markdown_report(
             session_id=interview_session.id,
             skill_name=skill_name,
             question_evaluations=question_evaluations,
+            question_groups=question_groups,
             summary=summary,
             rubric_name=rubric_name,
             generation_mode=generation_mode,
@@ -277,20 +280,31 @@ class EvaluationService:
             for item in report_json.get("question_evaluations", [])
         ]
         if report.status == InterviewReportStatus.GENERATED.value:
+            overall_score = self._coerce_optional_float(report_json.get("overall_score"))
+            dimension_scores = self._normalize_report_dimension_scores(
+                interview_session=interview_session,
+                answers=answers,
+                question_evaluations=question_evaluations,
+                raw_scores=report_json.get("dimension_scores", {}),
+                fallback_score=overall_score,
+            )
+            strengths, weaknesses, suggestions = InterviewSummarizer._curate_summary_lists(
+                strengths=self._coerce_report_string_list(report_json.get("strengths")),
+                weaknesses=self._coerce_report_string_list(report_json.get("weaknesses")),
+                suggestions=self._coerce_report_string_list(report_json.get("suggestions")),
+                overall_score=float(overall_score or 0.0),
+            )
             return InterviewReportDTO(
                 session_id=interview_session.id,
                 skill_id=interview_session.skill_id or "",
                 status=report.status,
                 summary_text=report.summary_text,
-                overall_score=self._coerce_optional_float(report_json.get("overall_score")),
+                overall_score=overall_score,
                 overall_rating=self._coerce_optional_string(report_json.get("overall_rating")),
-                strengths=list(report_json.get("strengths", [])),
-                weaknesses=list(report_json.get("weaknesses", [])),
-                suggestions=list(report_json.get("suggestions", [])),
-                dimension_scores={
-                    key: float(value)
-                    for key, value in dict(report_json.get("dimension_scores", {})).items()
-                },
+                strengths=strengths,
+                weaknesses=weaknesses,
+                suggestions=suggestions,
+                dimension_scores=dimension_scores,
                 question_evaluations=question_evaluations,
                 rubric_name=self._coerce_optional_string(report_json.get("rubric_name")),
                 rubric_path=self._coerce_optional_string(report_json.get("rubric_path")),
@@ -326,6 +340,33 @@ class EvaluationService:
             message=self._coerce_optional_string(report_json.get("message")) or "报告正在生成中，请稍后刷新。",
             error_message=report.error_message,
             generated_at=None,
+        )
+
+    def _normalize_report_dimension_scores(
+        self,
+        *,
+        interview_session: InterviewSessionEntity,
+        answers: list[InterviewAnswerEntity],
+        question_evaluations: list[InterviewQuestionEvaluationDTO],
+        raw_scores: Any,
+        fallback_score: float | None,
+    ) -> dict[str, float]:
+        """读取报告时也统一维度口径，兼容历史三维报告。"""
+
+        if fallback_score is None:
+            scores = [float(evaluation.score) for evaluation in question_evaluations]
+            fallback_score = round(sum(scores) / len(scores), 1) if scores else 0.0
+
+        question_items = self._build_question_items(interview_session, answers)
+        question_groups = self._build_question_groups(question_items)
+        question_group_summaries = InterviewSummarizer._build_question_group_summaries(
+            question_evaluations,
+            question_groups,
+        )
+        return InterviewSummarizer._normalize_dimension_scores(
+            dict(raw_scores or {}),
+            question_group_summaries=question_group_summaries,
+            fallback_score=float(fallback_score),
         )
 
     def _build_failed_report_dto(
@@ -402,6 +443,200 @@ class EvaluationService:
             for answer in answers
         ]
 
+    def _build_question_items(
+        self,
+        interview_session: InterviewSessionEntity,
+        answers: list[InterviewAnswerEntity],
+    ) -> list[dict[str, Any]]:
+        """Build evaluation items with main-question group and process-signal context."""
+
+        question_records = {
+            str(question.get("question_key", "")).strip(): question
+            for question in list(interview_session.questions_json or [])
+            if isinstance(question, dict) and str(question.get("question_key", "")).strip()
+        }
+        session_context = interview_session.session_context_json or {}
+        coverage_status = dict(session_context.get("coverage_status", {}))
+        observations = [
+            observation
+            for observation in list(session_context.get("answer_observations", []))
+            if isinstance(observation, dict)
+        ]
+        grouped_keys = self._resolve_group_sizes(answers, question_records)
+
+        items: list[dict[str, Any]] = []
+        for answer in answers:
+            question_key = str(answer.question_key or f"round-{answer.round_index}").strip()
+            question_record = question_records.get(question_key, {})
+            answer_metadata = answer.answer_metadata_json or {}
+            is_follow_up = bool(question_record.get("is_follow_up", answer_metadata.get("is_follow_up", False)))
+            main_question_key = self._resolve_main_question_key(
+                question_key=question_key,
+                question_record=question_record,
+                is_follow_up=is_follow_up,
+            )
+            main_question_record = question_records.get(main_question_key, {})
+            coverage = dict(coverage_status.get(main_question_key, {}))
+            observation = self._find_answer_observation(
+                observations,
+                question_key=question_key,
+                main_question_key=main_question_key,
+            )
+            group_keys = grouped_keys.get(main_question_key, [question_key])
+            items.append(
+                {
+                    "question_key": question_key,
+                    "round_index": answer.round_index,
+                    "question_text": answer.question_text,
+                    "answer_text": answer.answer_text,
+                    "main_question_key": main_question_key,
+                    "main_question_text": str(
+                        main_question_record.get("question_text")
+                        or question_record.get("question_text")
+                        or answer.question_text
+                    ),
+                    "question_role": "follow_up" if is_follow_up else "main",
+                    "group_position": max(1, group_keys.index(question_key) + 1) if question_key in group_keys else 1,
+                    "group_question_count": max(1, len(group_keys)),
+                    "coverage_status": str(
+                        observation.get("main_question_status")
+                        or coverage.get("status")
+                        or "unknown"
+                    ),
+                    "coverage_confidence": float(
+                        observation.get("confidence", coverage.get("confidence", 0.0)) or 0.0
+                    ),
+                    "observed_signals": self._coerce_string_list(
+                        observation.get("observed_signals") or coverage.get("observed_signals")
+                    ),
+                    "missing_signals": self._coerce_string_list(
+                        observation.get("missing_signals") or coverage.get("missing_signals")
+                    ),
+                    "process_reasoning": str(observation.get("reasoning", "")),
+                }
+            )
+        return items
+
+    def _build_question_groups(self, question_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Build weighted main-question groups for layered report summarization."""
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for item in question_items:
+            main_question_key = str(item.get("main_question_key") or item.get("question_key", "")).strip()
+            if not main_question_key:
+                continue
+            group = grouped.setdefault(
+                main_question_key,
+                {
+                    "main_question_key": main_question_key,
+                    "round_index": int(item.get("round_index", 0) or 0),
+                    "main_question_text": str(item.get("main_question_text") or item.get("question_text", "")),
+                    "coverage_status": str(item.get("coverage_status") or "unknown"),
+                    "coverage_confidence": float(item.get("coverage_confidence", 0.0) or 0.0),
+                    "observed_signals": [],
+                    "missing_signals": [],
+                    "questions": [],
+                    "main_weight": 0.65,
+                    "follow_up_weight_total": 0.35,
+                },
+            )
+            group["coverage_confidence"] = max(
+                float(group.get("coverage_confidence", 0.0) or 0.0),
+                float(item.get("coverage_confidence", 0.0) or 0.0),
+            )
+            if item.get("coverage_status") and item.get("coverage_status") != "unknown":
+                group["coverage_status"] = str(item.get("coverage_status"))
+            group["observed_signals"] = self._merge_string_lists(
+                group.get("observed_signals", []),
+                item.get("observed_signals", []),
+            )
+            group["missing_signals"] = self._merge_string_lists(
+                group.get("missing_signals", []),
+                item.get("missing_signals", []),
+            )
+            group["questions"].append(
+                {
+                    "question_key": item.get("question_key"),
+                    "question_role": item.get("question_role", "main"),
+                    "question_text": item.get("question_text", ""),
+                }
+            )
+        return list(grouped.values())
+
+    def _resolve_group_sizes(
+        self,
+        answers: list[InterviewAnswerEntity],
+        question_records: dict[str, dict[str, Any]],
+    ) -> dict[str, list[str]]:
+        """Resolve ordered question keys under each main-question group."""
+
+        grouped: dict[str, list[str]] = {}
+        for answer in answers:
+            question_key = str(answer.question_key or f"round-{answer.round_index}").strip()
+            question_record = question_records.get(question_key, {})
+            is_follow_up = bool(
+                question_record.get("is_follow_up", (answer.answer_metadata_json or {}).get("is_follow_up", False))
+            )
+            main_question_key = self._resolve_main_question_key(
+                question_key=question_key,
+                question_record=question_record,
+                is_follow_up=is_follow_up,
+            )
+            grouped.setdefault(main_question_key, []).append(question_key)
+        return grouped
+
+    @staticmethod
+    def _resolve_main_question_key(
+        *,
+        question_key: str,
+        question_record: dict[str, Any],
+        is_follow_up: bool,
+    ) -> str:
+        """Resolve the main question key for a main/follow-up answer."""
+
+        parent_key = str(question_record.get("parent_question_key") or "").strip()
+        if is_follow_up and parent_key:
+            return parent_key
+        if is_follow_up and "-f-" in question_key:
+            return question_key.split("-f-", 1)[0]
+        return str(question_record.get("question_key") or question_key).strip()
+
+    @staticmethod
+    def _find_answer_observation(
+        observations: list[dict[str, Any]],
+        *,
+        question_key: str,
+        main_question_key: str,
+    ) -> dict[str, Any]:
+        """Find the latest process observation for one answer."""
+
+        for observation in reversed(observations):
+            if str(observation.get("question_key", "")).strip() != question_key:
+                continue
+            if str(observation.get("main_question_key", "")).strip() not in {"", main_question_key}:
+                continue
+            return observation
+        return {}
+
+    @staticmethod
+    def _coerce_string_list(value: Any) -> list[str]:
+        """Coerce loose list-like values into clean strings."""
+
+        if value is None:
+            return []
+        raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+        return [str(item).strip() for item in raw_values if str(item).strip()]
+
+    @classmethod
+    def _merge_string_lists(cls, first: Any, second: Any) -> list[str]:
+        """Merge string lists while preserving order."""
+
+        merged: list[str] = []
+        for item in [*cls._coerce_string_list(first), *cls._coerce_string_list(second)]:
+            if item not in merged:
+                merged.append(item)
+        return merged
+
     def _load_rubric(self, skill_id: str) -> tuple[str, str, str]:
         """按 skill_id 优先读取 rubric，不存在时回退 common。"""
 
@@ -435,6 +670,7 @@ class EvaluationService:
         skill_name: str,
         question_evaluations: list[InterviewQuestionEvaluationDTO],
         summary: dict[str, Any],
+        question_groups: list[dict[str, Any]] | None = None,
         rubric_name: str,
         generation_mode: str,
     ) -> str:
@@ -459,9 +695,9 @@ class EvaluationService:
             "",
         ]
         lines.extend([f"- {item}" for item in summary.get("strengths", [])] or ["- 暂无"])
-        lines.extend(["", "## 待提升点", ""])
+        lines.extend(["", "## 待提升领域", ""])
         lines.extend([f"- {item}" for item in summary.get("weaknesses", [])] or ["- 暂无"])
-        lines.extend(["", "## 建议", ""])
+        lines.extend(["", "## 后续复盘方向", ""])
         lines.extend([f"- {item}" for item in summary.get("suggestions", [])] or ["- 暂无"])
         lines.extend(["", "## 维度分", ""])
         lines.extend(
@@ -493,7 +729,7 @@ class EvaluationService:
             lines.extend([f"- {item}" for item in evaluation.strengths] or ["- 暂无"])
             lines.extend(["", "**短板**", ""])
             lines.extend([f"- {item}" for item in evaluation.weaknesses] or ["- 暂无"])
-            lines.extend(["", "**建议**", ""])
+            lines.extend(["", "**后续复盘方向**", ""])
             lines.extend([f"- {item}" for item in evaluation.suggestions] or ["- 暂无"])
             lines.append("")
         return "\n".join(lines).strip()
@@ -558,6 +794,15 @@ class EvaluationService:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _coerce_report_string_list(value: Any) -> list[str]:
+        """读取历史报告时把宽松数组字段整理为字符串数组。"""
+
+        if value is None:
+            return []
+        raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+        return [str(item).strip() for item in raw_values if str(item).strip()]
 
 
 evaluation_service = EvaluationService()

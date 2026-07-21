@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
 
 from loguru import logger
@@ -16,6 +17,37 @@ from app.models.interview import InterviewQuestionEvaluationDTO
 DEFAULT_EVALUATION_PROMPT_DIR = Path(__file__).resolve().parents[3] / "prompts" / "evaluation"
 
 _KEYWORDS_FOR_SCORE = ("实现", "落地", "权衡", "监控", "回滚", "故障", "性能", "事务", "缓存", "一致性")
+_PHRASE_SPLIT_PATTERN = re.compile(r"[,，、;\n]+")
+
+
+def _normalize_phrase_list(value: Any) -> list[str]:
+    """Normalize loose sequence fields to stable string arrays."""
+
+    if value is None:
+        return []
+
+    items: list[str] = []
+    raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+    for raw_value in raw_values:
+        if raw_value is None:
+            continue
+        if isinstance(raw_value, str):
+            candidates = _PHRASE_SPLIT_PATTERN.split(raw_value)
+        else:
+            candidates = [str(raw_value)]
+        for candidate in candidates:
+            normalized = candidate.strip()
+            if normalized:
+                items.append(normalized)
+
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduplicated.append(item)
+    return deduplicated
 
 
 class _BatchQuestionEvaluationOutput(BaseModel):
@@ -41,9 +73,10 @@ class _BatchQuestionEvaluationOutput(BaseModel):
 
         normalized = dict(value)
         for field_name in ("strengths", "weaknesses", "suggestions"):
-            field_value = normalized.get(field_name)
-            if isinstance(field_value, str):
-                normalized[field_name] = [field_value] if field_value.strip() else []
+            normalized[field_name] = _normalize_phrase_list(normalized.get(field_name))
+        rationale = str(normalized.get("rationale", "") or "").strip()
+        if not rationale:
+            normalized["rationale"] = "基于回答内容给出综合评估。"
         return normalized
 
 
@@ -69,6 +102,10 @@ class _BatchQuestionEvaluationsOutput(BaseModel):
         normalized = dict(value)
         normalized.pop("batch_index", None)
         normalized.pop("batch_total", None)
+        if isinstance(normalized.get("question_evaluations"), dict):
+            normalized["question_evaluations"] = [normalized["question_evaluations"]]
+        if isinstance(normalized.get("evaluations"), dict):
+            normalized["evaluations"] = [normalized["evaluations"]]
         return normalized
 
 
@@ -80,6 +117,16 @@ class _NormalizedQuestion:
     round_index: int
     question_text: str
     answer_text: str
+    main_question_key: str
+    main_question_text: str
+    question_role: str
+    group_position: int
+    group_question_count: int
+    coverage_status: str
+    coverage_confidence: float
+    observed_signals: list[str]
+    missing_signals: list[str]
+    process_reasoning: str
 
 
 class BatchEvaluator:
@@ -192,6 +239,16 @@ class BatchEvaluator:
         for item in batch_items:
             result = output_by_key.get(item.question_key)
             if result is None:
+                if item.question_role == "follow_up":
+                    main_result = output_by_key.get(item.main_question_key)
+                    if main_result is not None:
+                        logger.info(
+                            "追问评估缺项，使用主问题组评估派生: fallback_applied=true, fallback_type=group_derived, stage=batch_evaluator_merge, question_key={}, main_question_key={}",
+                            item.question_key,
+                            item.main_question_key,
+                        )
+                        merged_results.append(self._build_group_derived_follow_up_evaluation(item, main_result))
+                        continue
                 logger.warning(
                     "批量评估结果缺项，补齐规则兜底: fallback_applied=true, fallback_type=rule, stage=batch_evaluator_merge, question_key={}",
                     item.question_key,
@@ -216,6 +273,58 @@ class BatchEvaluator:
             )
         return merged_results
 
+    def _build_group_derived_follow_up_evaluation(
+        self,
+        item: _NormalizedQuestion,
+        main_result: _BatchQuestionEvaluationOutput,
+    ) -> InterviewQuestionEvaluationDTO:
+        """当模型只返回主问题组评估时，为追问生成稳定的组内派生评价。"""
+
+        score = float(main_result.score)
+        if item.coverage_status in {"covered", "complete"} or item.coverage_confidence >= 0.75:
+            score = min(100.0, score + 2.0)
+        elif item.missing_signals:
+            score = max(0.0, score - min(len(item.missing_signals) * 1.5, 5.0))
+        score = round(score, 1)
+
+        strengths = [text.strip() for text in main_result.strengths if text.strip()]
+        if item.observed_signals:
+            strengths = self._deduplicate_texts(
+                [*strengths, f"追问补充了{self._join_limited(item.observed_signals)}等过程信号"]
+            )
+        if not strengths:
+            strengths = ["追问回答可作为主问题组的补充证据"]
+
+        weaknesses = [text.strip() for text in main_result.weaknesses if text.strip()]
+        if item.missing_signals:
+            weaknesses = self._deduplicate_texts(
+                [*weaknesses, f"追问后仍有{self._join_limited(item.missing_signals)}等信息不足"]
+            )
+        if not weaknesses:
+            weaknesses = ["可进一步补充更具体的实现细节或量化结果"]
+
+        suggestions = [text.strip() for text in main_result.suggestions if text.strip()]
+        if not suggestions:
+            suggestions = ["围绕追问暴露出的薄弱点补充一次真实项目复盘"]
+
+        rationale = (
+            f"模型返回了主问题组 {item.main_question_key} 的评估，但未单独返回追问 {item.question_key}；"
+            "系统按主问题组口径结合追问过程信号派生本条评价，避免追问被等权放大。"
+        )
+        return InterviewQuestionEvaluationDTO(
+            question_key=item.question_key,
+            round_index=item.round_index,
+            question_text=item.question_text,
+            answer_text=item.answer_text,
+            score=score,
+            rating=main_result.rating.strip() or self._rating_from_score(score),
+            strengths=strengths,
+            weaknesses=weaknesses,
+            suggestions=suggestions,
+            rationale=rationale,
+            source="llm_group_derived",
+        )
+
     def _build_fallback_evaluation(self, item: _NormalizedQuestion) -> InterviewQuestionEvaluationDTO:
         """基于规则生成稳定的题目评估。"""
 
@@ -225,6 +334,11 @@ class BatchEvaluator:
         score += min(keyword_hits * 8.0, 24.0)
         if len(answer_text) < 40:
             score -= 10.0
+        if item.coverage_confidence >= 0.75:
+            score += 4.0
+        elif item.coverage_confidence and item.coverage_confidence < 0.35:
+            score -= 6.0
+        score -= min(len(item.missing_signals) * 1.5, 6.0)
         score = max(10.0, min(100.0, round(score, 1)))
 
         strengths: list[str] = []
@@ -238,6 +352,8 @@ class BatchEvaluator:
         weaknesses: list[str] = []
         if len(answer_text) < 80:
             weaknesses.append("细节展开仍然不足")
+        if item.missing_signals:
+            weaknesses.append(f"{len(item.missing_signals)} expected signals are still weak or missing")
         if keyword_hits == 0:
             weaknesses.append("缺少具体实现或权衡说明")
         if not weaknesses:
@@ -298,8 +414,20 @@ class BatchEvaluator:
             lines.append("<question_item>")
             lines.append(f"  <question_key>{item.question_key}</question_key>")
             lines.append(f"  <round_index>{item.round_index}</round_index>")
+            lines.append(f"  <main_question_key>{item.main_question_key}</main_question_key>")
+            lines.append(f"  <question_role>{item.question_role}</question_role>")
+            lines.append(f"  <group_position>{item.group_position}</group_position>")
+            lines.append(f"  <group_question_count>{item.group_question_count}</group_question_count>")
+            lines.append(f"  <main_question_text>{self._escape_text(item.main_question_text)}</main_question_text>")
             lines.append(f"  <question_text>{self._escape_text(item.question_text)}</question_text>")
             lines.append(f"  <answer_text>{self._escape_text(item.answer_text)}</answer_text>")
+            lines.append("  <process_signals>")
+            lines.append(f"    <coverage_status>{self._escape_text(item.coverage_status)}</coverage_status>")
+            lines.append(f"    <coverage_confidence>{item.coverage_confidence:.2f}</coverage_confidence>")
+            lines.append(f"    <observed_signals>{self._escape_text('; '.join(item.observed_signals))}</observed_signals>")
+            lines.append(f"    <missing_signals>{self._escape_text('; '.join(item.missing_signals))}</missing_signals>")
+            lines.append(f"    <reasoning>{self._escape_text(item.process_reasoning)}</reasoning>")
+            lines.append("  </process_signals>")
             lines.append("</question_item>")
         return "\n".join(lines)
 
@@ -308,6 +436,27 @@ class BatchEvaluator:
         """避免 prompt 中的标签被意外截断。"""
 
         return value.replace("<", "＜").replace(">", "＞").strip()
+
+    @staticmethod
+    def _deduplicate_texts(values: list[str]) -> list[str]:
+        """保持顺序去重并移除空字符串。"""
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            normalized = value.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(normalized)
+        return result
+
+    @staticmethod
+    def _join_limited(values: list[str], *, limit: int = 2) -> str:
+        """把少量过程信号拼成适合报告展示的短句。"""
+
+        cleaned = [value.strip() for value in values if value.strip()]
+        return "、".join(cleaned[:limit]) if cleaned else "相关"
 
     @staticmethod
     def _wrap(tag_name: str, content: str) -> str:
@@ -329,6 +478,16 @@ class BatchEvaluator:
             round_index=int(item.get("round_index", 0)),
             question_text=str(item.get("question_text", "")).strip(),
             answer_text=str(item.get("answer_text", "")).strip(),
+            main_question_key=str(item.get("main_question_key") or item.get("question_key", "")).strip(),
+            main_question_text=str(item.get("main_question_text") or item.get("question_text", "")).strip(),
+            question_role=str(item.get("question_role") or "main").strip(),
+            group_position=int(item.get("group_position", 1) or 1),
+            group_question_count=int(item.get("group_question_count", 1) or 1),
+            coverage_status=str(item.get("coverage_status") or "unknown").strip(),
+            coverage_confidence=max(0.0, min(1.0, float(item.get("coverage_confidence", 0.0) or 0.0))),
+            observed_signals=_normalize_phrase_list(item.get("observed_signals")),
+            missing_signals=_normalize_phrase_list(item.get("missing_signals")),
+            process_reasoning=str(item.get("process_reasoning", "")).strip(),
         )
 
     def _chunk_items(self, items: list[_NormalizedQuestion]) -> list[list[_NormalizedQuestion]]:

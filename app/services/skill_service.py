@@ -1,5 +1,6 @@
 """预设 Skill 的加载、解析与查询服务。"""
 
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -26,7 +27,11 @@ _FRONT_MATTER_PATTERN = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)\Z", re.DOTAL
 
 @dataclass(slots=True)
 class _ParsedSkillDocument:
-    """解析后的 SKILL.md 文档内容。"""
+    """
+    解析后的 SKILL.md 文档数据模型。
+    
+    使用 slots=True 优化内存结构，禁止动态添加属性，适合批量解析时的高效存储。
+    """
 
     name: str
     description: str

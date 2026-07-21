@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha256
 import mimetypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -69,10 +70,253 @@ class KnowledgeService:
         repository: KnowledgeRepository | None = None,
         storage_client: StorageClient | None = None,
         index_service: VectorIndexService | None = None,
-    ) -> None:
+        ) -> None:
         self._repository = repository
         self._storage_client = storage_client
         self._index_service = index_service or vector_index_service
+
+    async def create_knowledge_base(
+        self,
+        session: AsyncSession,
+        *,
+        name: str,
+        category: str,
+        source_type: str,
+        description: str | None = None,
+        skill_id: str | None = None,
+        visitor_id: str | None = None,
+    ) -> KnowledgeBaseEntity:
+        """创建逻辑知识库记录，不上传文件也不触发索引。"""
+
+        sanitized_name, sanitized_category, sanitized_source_type = self._validate_base_inputs(
+            name=name,
+            category=category,
+            source_type=source_type,
+        )
+        repository = self._resolve_repository(session)
+        knowledge_base = KnowledgeBaseEntity(
+            id=self._generate_identifier(),
+            visitor_id=visitor_id,
+            name=sanitized_name,
+            description=description,
+            category=sanitized_category,
+            skill_id=skill_id,
+            source_type=sanitized_source_type,
+            status=KnowledgeBaseStatus.ACTIVE.value,
+            is_enabled=True,
+            vector_collection_name=config.milvus.collection_name,
+            metadata_json={
+                "doc_type": "domain_corpus",
+                "content_hash": "",
+                "document_count": 0,
+                "category": sanitized_category,
+                "source_type": sanitized_source_type,
+                "skill_id": skill_id,
+            },
+        )
+        await self._create_knowledge_base_record_and_commit(
+            session=session,
+            repository=repository,
+            knowledge_base=knowledge_base,
+        )
+        return knowledge_base
+
+    async def add_document_to_knowledge_base(
+        self,
+        session: AsyncSession,
+        *,
+        knowledge_base_id: str,
+        file_name: str,
+        file_content: bytes,
+        content_type: str | None = None,
+        source_type: str | None = None,
+        category: str | None = None,
+        skill_id: str | None = None,
+    ) -> KnowledgeUploadResult:
+        """向已有知识库追加单个文档并完成上传、索引与状态回写。"""
+
+        if not knowledge_base_id.strip():
+            raise BusinessException(
+                code=ErrorCode.BAD_REQUEST,
+                message="知识库 ID 不能为空",
+            )
+        if not file_name.strip():
+            raise BusinessException(
+                code=ErrorCode.BAD_REQUEST,
+                message="文件名不能为空",
+            )
+        if not file_content:
+            raise BusinessException(
+                code=ErrorCode.BAD_REQUEST,
+                message="上传文件不能为空",
+            )
+
+        repository = self._resolve_repository(session)
+        knowledge_base = await repository.get_knowledge_base(knowledge_base_id.strip())
+        if knowledge_base is None:
+            raise BusinessException(
+                code=ErrorCode.KNOWLEDGE_BASE_NOT_FOUND,
+                message="知识库不存在",
+                http_status=404,
+                details={"knowledge_base_id": knowledge_base_id},
+            )
+
+        safe_file_name = self._sanitize_file_name(file_name)
+        file_extension = self._get_file_extension(safe_file_name)
+        if file_extension not in ALLOWED_KNOWLEDGE_FILE_EXTENSIONS:
+            raise BusinessException(
+                code=ErrorCode.KNOWLEDGE_FILE_TYPE_NOT_SUPPORTED,
+                message="仅支持上传 .txt 和 .md 文件",
+                details={"file_name": safe_file_name, "file_extension": file_extension},
+            )
+        if len(file_content) > MAX_KNOWLEDGE_FILE_SIZE_BYTES:
+            raise BusinessException(
+                code=ErrorCode.KNOWLEDGE_FILE_TOO_LARGE,
+                message="知识库文件大小超过限制",
+                details={
+                    "file_name": safe_file_name,
+                    "file_size": len(file_content),
+                    "max_size": MAX_KNOWLEDGE_FILE_SIZE_BYTES,
+                },
+            )
+
+        _, resolved_category, resolved_source_type = self._validate_base_inputs(
+            name=knowledge_base.name,
+            category=category if category is not None else knowledge_base.category,
+            source_type=source_type if source_type is not None else knowledge_base.source_type,
+        )
+        resolved_skill_id = skill_id if skill_id is not None else knowledge_base.skill_id
+        content_hash = sha256(file_content).hexdigest()
+        document_id = self._generate_identifier()
+        storage_object_key = self._build_storage_object_key(
+            knowledge_base_id=knowledge_base.id,
+            document_id=document_id,
+            file_name=safe_file_name,
+        )
+
+        document = KnowledgeDocumentEntity(
+            id=document_id,
+            knowledge_base_id=knowledge_base.id,
+            original_file_name=safe_file_name,
+            storage_path=storage_object_key,
+            file_extension=file_extension,
+            mime_type=self._resolve_mime_type(content_type=content_type, file_extension=file_extension),
+            file_size=len(file_content),
+            source_type=resolved_source_type,
+            category=resolved_category,
+            skill_id=resolved_skill_id,
+            index_status=KnowledgeDocumentIndexStatus.UPLOADED.value,
+            is_enabled=True,
+            metadata_json={
+                "doc_type": "domain_corpus",
+                "content_hash": content_hash,
+                "storage_object_key": storage_object_key,
+                "file_name": safe_file_name,
+            },
+        )
+        await self._create_document_record_and_commit(
+            session=session,
+            repository=repository,
+            document=document,
+        )
+
+        storage_client = self._resolve_storage_client()
+        try:
+            stored_path = await storage_client.upload_file(storage_object_key, file_content)
+        except Exception as exc:
+            await self._mark_document_failed(
+                session=session,
+                repository=repository,
+                document=document,
+                error_message=str(exc),
+            )
+            raise BusinessException(
+                code=ErrorCode.STORAGE_UPLOAD_FAILED,
+                message="知识库文件上传失败",
+                http_status=500,
+                details={
+                    "knowledge_base_id": knowledge_base.id,
+                    "document_id": document.id,
+                    "error": str(exc),
+                },
+            ) from exc
+
+        document.storage_path = stored_path
+        document.index_status = KnowledgeDocumentIndexStatus.INDEXING.value
+        document.metadata_json = {
+            **document.metadata_json,
+            "storage_path": stored_path,
+        }
+        await self._upsert_document_and_commit(
+            session=session,
+            repository=repository,
+            document=document,
+            message="知识库文件状态更新失败",
+        )
+
+        indexing_result = await asyncio.to_thread(
+            self._index_service.index_knowledge_document,
+            document,
+        )
+        if not indexing_result.success:
+            await self._mark_document_failed(
+                session=session,
+                repository=repository,
+                document=document,
+                error_message=indexing_result.error_message or "向量化入库失败",
+            )
+            raise BusinessException(
+                code=ErrorCode.KNOWLEDGE_INDEX_FAILED,
+                message="知识库文件向量化失败",
+                http_status=500,
+                details={
+                    "knowledge_base_id": knowledge_base.id,
+                    "document_id": document.id,
+                    "error": indexing_result.error_message,
+                },
+            )
+
+        indexed_at = datetime.now(timezone.utc)
+        document.index_status = KnowledgeDocumentIndexStatus.INDEXED.value
+        document.indexed_at = indexed_at
+        document.error_message = None
+        document.metadata_json = {
+            **document.metadata_json,
+            "chunk_count": indexing_result.chunk_count,
+            "indexed_at": indexed_at.isoformat(),
+        }
+        knowledge_base.metadata_json = {
+            **dict(knowledge_base.metadata_json or {}),
+            "doc_type": "domain_corpus",
+            "content_hash": content_hash,
+            "document_count": int(knowledge_base.metadata_json.get("document_count", 0) or 0) + 1,
+        }
+        await self._upsert_knowledge_base_and_document_and_commit(
+            session=session,
+            repository=repository,
+            knowledge_base=knowledge_base,
+            document=document,
+            message="知识库索引状态回写失败",
+        )
+
+        logger.info(
+            "知识库文档追加完成: knowledge_base_id={}, document_id={}, chunk_count={}",
+            knowledge_base.id,
+            document.id,
+            indexing_result.chunk_count,
+        )
+        return KnowledgeUploadResult(
+            knowledge_base_id=knowledge_base.id,
+            document_id=document.id,
+            name=knowledge_base.name,
+            category=document.category,
+            source_type=document.source_type,
+            skill_id=document.skill_id,
+            file_name=safe_file_name,
+            file_size=len(file_content),
+            index_status=document.index_status,
+            chunk_count=indexing_result.chunk_count,
+        )
 
     async def upload_knowledge_document(
         self,
@@ -107,6 +351,87 @@ class KnowledgeService:
             KnowledgeUploadResult: 上传与索引结果
         """
 
+        knowledge_base = await self.create_knowledge_base(
+            session,
+            name=name,
+            category=category,
+            source_type=source_type,
+            description=description,
+            skill_id=skill_id,
+            visitor_id=visitor_id,
+        )
+        return await self.add_document_to_knowledge_base(
+            session,
+            knowledge_base_id=knowledge_base.id,
+            file_name=file_name,
+            file_content=file_content,
+            content_type=content_type,
+            source_type=source_type,
+            category=category,
+            skill_id=skill_id,
+        )
+
+    async def list_public_knowledge_bases(
+        self,
+        session: AsyncSession,
+        *,
+        category: str | None = None,
+        skill_id: str | None = None,
+        limit: int = 50,
+    ) -> list[KnowledgeBaseEntity]:
+        """列出公开可见的启用知识库。"""
+
+        repository = self._resolve_repository(session)
+        return await repository.list_knowledge_bases(
+            category=category.strip() if category else None,
+            skill_id=skill_id.strip() if skill_id else None,
+            enabled_only=True,
+            limit=limit,
+        )
+
+    async def get_public_knowledge_base_detail(
+        self,
+        session: AsyncSession,
+        *,
+        knowledge_base_id: str,
+    ) -> tuple[KnowledgeBaseEntity, list[KnowledgeDocumentEntity]]:
+        """获取公开可见知识库详情与启用文档。"""
+
+        repository = self._resolve_repository(session)
+        knowledge_base = await repository.get_knowledge_base(knowledge_base_id.strip())
+        if knowledge_base is None or not knowledge_base.is_enabled:
+            raise BusinessException(
+                code=ErrorCode.KNOWLEDGE_BASE_NOT_FOUND,
+                message="知识库不存在",
+                http_status=404,
+                details={"knowledge_base_id": knowledge_base_id},
+            )
+
+        documents = await repository.list_enabled_documents_by_knowledge_base(
+            knowledge_base.id,
+            limit=500,
+        )
+        return knowledge_base, documents
+
+    def _resolve_repository(self, session: AsyncSession) -> KnowledgeRepository:
+        """解析当前请求要使用的知识库仓储。"""
+
+        return self._repository or KnowledgeRepository(session)
+
+    def _resolve_storage_client(self) -> StorageClient:
+        """解析当前要使用的存储客户端。"""
+
+        return self._storage_client or storage_manager.get_client()
+
+    def _validate_base_inputs(
+        self,
+        *,
+        name: str,
+        category: str,
+        source_type: str,
+    ) -> tuple[str, str, str]:
+        """校验并返回知识库主记录所需的基础字段。"""
+
         sanitized_name = name.strip()
         sanitized_category = category.strip()
         sanitized_source_type = source_type.strip()
@@ -126,187 +451,7 @@ class KnowledgeService:
                 code=ErrorCode.BAD_REQUEST,
                 message="来源类型不能为空",
             )
-        if not file_name.strip():
-            raise BusinessException(
-                code=ErrorCode.BAD_REQUEST,
-                message="文件名不能为空",
-            )
-        if not file_content:
-            raise BusinessException(
-                code=ErrorCode.BAD_REQUEST,
-                message="上传文件不能为空",
-            )
-
-        safe_file_name = self._sanitize_file_name(file_name)
-        file_extension = self._get_file_extension(safe_file_name)
-        if file_extension not in ALLOWED_KNOWLEDGE_FILE_EXTENSIONS:
-            raise BusinessException(
-                code=ErrorCode.KNOWLEDGE_FILE_TYPE_NOT_SUPPORTED,
-                message="仅支持上传 .txt 和 .md 文件",
-                details={"file_name": safe_file_name, "file_extension": file_extension},
-            )
-        if len(file_content) > MAX_KNOWLEDGE_FILE_SIZE_BYTES:
-            raise BusinessException(
-                code=ErrorCode.KNOWLEDGE_FILE_TOO_LARGE,
-                message="知识库文件大小超过限制",
-                details={
-                    "file_name": safe_file_name,
-                    "file_size": len(file_content),
-                    "max_size": MAX_KNOWLEDGE_FILE_SIZE_BYTES,
-                },
-            )
-
-        knowledge_base_id = self._generate_identifier()
-        document_id = self._generate_identifier()
-        storage_object_key = self._build_storage_object_key(
-            knowledge_base_id=knowledge_base_id,
-            document_id=document_id,
-            file_name=safe_file_name,
-        )
-
-        knowledge_base = KnowledgeBaseEntity(
-            id=knowledge_base_id,
-            visitor_id=visitor_id,
-            name=sanitized_name,
-            description=description,
-            category=sanitized_category,
-            skill_id=skill_id,
-            source_type=sanitized_source_type,
-            status=KnowledgeBaseStatus.ACTIVE.value,
-            vector_collection_name=config.milvus.collection_name,
-            metadata_json={
-                "document_count": 1,
-                "category": sanitized_category,
-                "source_type": sanitized_source_type,
-                "skill_id": skill_id,
-            },
-        )
-        document = KnowledgeDocumentEntity(
-            id=document_id,
-            knowledge_base_id=knowledge_base_id,
-            original_file_name=safe_file_name,
-            storage_path=storage_object_key,
-            file_extension=file_extension,
-            mime_type=self._resolve_mime_type(content_type=content_type, file_extension=file_extension),
-            file_size=len(file_content),
-            source_type=sanitized_source_type,
-            category=sanitized_category,
-            skill_id=skill_id,
-            index_status=KnowledgeDocumentIndexStatus.UPLOADED.value,
-            metadata_json={
-                "storage_object_key": storage_object_key,
-                "file_name": safe_file_name,
-            },
-        )
-
-        repository = self._resolve_repository(session)
-        await self._create_records_and_commit(
-            session=session,
-            repository=repository,
-            knowledge_base=knowledge_base,
-            document=document,
-        )
-
-        storage_client = self._resolve_storage_client()
-        try:
-            stored_path = await storage_client.upload_file(storage_object_key, file_content)
-        except Exception as exc:
-            await self._mark_document_failed(
-                session=session,
-                repository=repository,
-                document=document,
-                error_message=str(exc),
-            )
-            raise BusinessException(
-                code=ErrorCode.STORAGE_UPLOAD_FAILED,
-                message="知识库文件上传失败",
-                http_status=500,
-                details={
-                    "knowledge_base_id": knowledge_base_id,
-                    "document_id": document_id,
-                    "error": str(exc),
-                },
-            ) from exc
-
-        document.storage_path = stored_path
-        document.index_status = KnowledgeDocumentIndexStatus.INDEXING.value
-        document.metadata_json = {
-            **document.metadata_json,
-            "storage_path": stored_path,
-        }
-        await self._upsert_document_and_commit(
-            session=session,
-            repository=repository,
-            document=document,
-            message="知识库文件状态更新失败",
-        )
-
-        indexing_result = await asyncio.to_thread(
-            self._index_service.index_knowledge_document,
-            document,
-        )
-        if not indexing_result.success:
-            await self._mark_document_failed(
-                session=session,
-                repository=repository,
-                document=document,
-                error_message=indexing_result.error_message or "向量化入库失败",
-            )
-            raise BusinessException(
-                code=ErrorCode.KNOWLEDGE_INDEX_FAILED,
-                message="知识库文件向量化失败",
-                http_status=500,
-                details={
-                    "knowledge_base_id": knowledge_base_id,
-                    "document_id": document_id,
-                    "error": indexing_result.error_message,
-                },
-            )
-
-        indexed_at = datetime.now(timezone.utc)
-        document.index_status = KnowledgeDocumentIndexStatus.INDEXED.value
-        document.indexed_at = indexed_at
-        document.error_message = None
-        document.metadata_json = {
-            **document.metadata_json,
-            "chunk_count": indexing_result.chunk_count,
-            "indexed_at": indexed_at.isoformat(),
-        }
-        await self._upsert_document_and_commit(
-            session=session,
-            repository=repository,
-            document=document,
-            message="知识库索引状态回写失败",
-        )
-
-        logger.info(
-            "知识库上传完成: knowledge_base_id={}, document_id={}, chunk_count={}",
-            knowledge_base_id,
-            document_id,
-            indexing_result.chunk_count,
-        )
-        return KnowledgeUploadResult(
-            knowledge_base_id=knowledge_base_id,
-            document_id=document_id,
-            name=sanitized_name,
-            category=sanitized_category,
-            source_type=sanitized_source_type,
-            skill_id=skill_id,
-            file_name=safe_file_name,
-            file_size=len(file_content),
-            index_status=document.index_status,
-            chunk_count=indexing_result.chunk_count,
-        )
-
-    def _resolve_repository(self, session: AsyncSession) -> KnowledgeRepository:
-        """解析当前请求要使用的知识库仓储。"""
-
-        return self._repository or KnowledgeRepository(session)
-
-    def _resolve_storage_client(self) -> StorageClient:
-        """解析当前要使用的存储客户端。"""
-
-        return self._storage_client or storage_manager.get_client()
+        return sanitized_name, sanitized_category, sanitized_source_type
 
     async def _commit_or_raise(
         self,
@@ -357,25 +502,22 @@ class KnowledgeService:
                 document.id,
             )
 
-    async def _create_records_and_commit(
+    async def _create_knowledge_base_record_and_commit(
         self,
         *,
         session: AsyncSession,
         repository: KnowledgeRepository,
         knowledge_base: KnowledgeBaseEntity,
-        document: KnowledgeDocumentEntity,
     ) -> None:
-        """写入知识库主记录与文件记录并提交。"""
+        """写入知识库主记录并提交。"""
 
         try:
             await repository.add_knowledge_base(knowledge_base)
-            await repository.add_document(document)
         except Exception as exc:
             await session.rollback()
             logger.exception(
-                "知识库初始记录写入失败: knowledge_base_id={}, document_id={}",
+                "知识库主记录写入失败: knowledge_base_id={}",
                 knowledge_base.id,
-                document.id,
             )
             raise BusinessException(
                 code=ErrorCode.KNOWLEDGE_PERSIST_FAILED,
@@ -383,7 +525,6 @@ class KnowledgeService:
                 http_status=500,
                 details={
                     "knowledge_base_id": knowledge_base.id,
-                    "document_id": document.id,
                     "error": str(exc),
                 },
             ) from exc
@@ -394,6 +535,44 @@ class KnowledgeService:
             message="知识库记录创建失败",
             details={
                 "knowledge_base_id": knowledge_base.id,
+            },
+        )
+
+    async def _create_document_record_and_commit(
+        self,
+        *,
+        session: AsyncSession,
+        repository: KnowledgeRepository,
+        document: KnowledgeDocumentEntity,
+    ) -> None:
+        """写入知识库文件记录并提交。"""
+
+        try:
+            await repository.add_document(document)
+        except Exception as exc:
+            await session.rollback()
+            logger.exception(
+                "知识库文件记录创建失败: knowledge_base_id={}, document_id={}",
+                document.knowledge_base_id,
+                document.id,
+            )
+            raise BusinessException(
+                code=ErrorCode.KNOWLEDGE_PERSIST_FAILED,
+                message="知识库文件记录创建失败",
+                http_status=500,
+                details={
+                    "knowledge_base_id": document.knowledge_base_id,
+                    "document_id": document.id,
+                    "error": str(exc),
+                },
+            ) from exc
+
+        await self._commit_or_raise(
+            session,
+            code=ErrorCode.KNOWLEDGE_PERSIST_FAILED,
+            message="知识库文件记录创建失败",
+            details={
+                "knowledge_base_id": document.knowledge_base_id,
                 "document_id": document.id,
             },
         )
@@ -434,6 +613,48 @@ class KnowledgeService:
             message=message,
             details={
                 "knowledge_base_id": document.knowledge_base_id,
+                "document_id": document.id,
+            },
+        )
+
+    async def _upsert_knowledge_base_and_document_and_commit(
+        self,
+        *,
+        session: AsyncSession,
+        repository: KnowledgeRepository,
+        knowledge_base: KnowledgeBaseEntity,
+        document: KnowledgeDocumentEntity,
+        message: str,
+    ) -> None:
+        """同时更新知识库主记录与文件记录并提交。"""
+
+        try:
+            await repository.upsert_knowledge_base(knowledge_base)
+            await repository.upsert_document(document)
+        except Exception as exc:
+            await session.rollback()
+            logger.exception(
+                "知识库与文件记录联合更新失败: knowledge_base_id={}, document_id={}",
+                knowledge_base.id,
+                document.id,
+            )
+            raise BusinessException(
+                code=ErrorCode.KNOWLEDGE_PERSIST_FAILED,
+                message=message,
+                http_status=500,
+                details={
+                    "knowledge_base_id": knowledge_base.id,
+                    "document_id": document.id,
+                    "error": str(exc),
+                },
+            ) from exc
+
+        await self._commit_or_raise(
+            session,
+            code=ErrorCode.KNOWLEDGE_PERSIST_FAILED,
+            message=message,
+            details={
+                "knowledge_base_id": knowledge_base.id,
                 "document_id": document.id,
             },
         )

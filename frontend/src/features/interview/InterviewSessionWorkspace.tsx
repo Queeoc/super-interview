@@ -1,25 +1,27 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 
-import { FeedbackState, MarkdownRenderer, SectionCard } from '../../components/ui';
+import { FeedbackState, SectionCard } from '../../components/ui';
 import { useDebouncedEffect } from '../../hooks/useDebouncedEffect';
 import { submitInterviewAnswerStream } from '../../services/api';
 import type {
   InterviewAnswerHistoryDto,
   InterviewContentEvent,
   InterviewErrorEvent,
+  InterviewProcessRunDto,
+  InterviewProcessStepStatus,
+  InterviewProcessToolSummary,
   InterviewQuestionSnapshot,
-  InterviewReportDto,
   InterviewStepCompleteEvent,
+  InterviewStatusEvent,
   InterviewStreamEvent
 } from '../../types';
-import { formatDateTime, formatScore } from '../../utils/format';
+import { formatDateTime } from '../../utils/format';
 import { setRecentInterviewSessionId } from '../../utils/storage';
 import styles from './InterviewSessionWorkspace.module.css';
 import {
   useCompleteInterviewSession,
-  useInterviewReport,
-  useInterviewReportExport,
   useInterviewSession,
   useSaveInterviewDraft
 } from './useInterview';
@@ -32,6 +34,39 @@ type OptimisticAnswer = {
   questionKey: string | null;
   roundIndex: number;
   content: string;
+};
+
+type ProcessStepStatus = InterviewProcessStepStatus;
+
+type ProcessStepId =
+  | 'submit'
+  | 'observation'
+  | 'replan'
+  | 'tool_prepare'
+  | 'tool_call'
+  | 'llm'
+  | 'persist'
+  | 'report'
+  | 'done';
+
+type ProcessToolSummary = InterviewProcessToolSummary;
+
+type ProcessStep = {
+  id: ProcessStepId;
+  label: string;
+  detail?: string;
+  status: ProcessStepStatus;
+  toolSummary?: ProcessToolSummary;
+  timestamp: number;
+};
+
+type ProcessRun = {
+  id: string;
+  questionKey: string | null;
+  roundIndex: number;
+  status: 'running' | 'completed' | 'failed';
+  collapsed: boolean;
+  steps: ProcessStep[];
 };
 
 type ChatMessage =
@@ -57,8 +92,6 @@ type ChatMessage =
 export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspaceProps) {
   const queryClient = useQueryClient();
   const sessionQuery = useInterviewSession(sessionId);
-  const reportQuery = useInterviewReport(sessionId);
-  const exportQuery = useInterviewReportExport(sessionId);
   const draftMutation = useSaveInterviewDraft(sessionId);
   const completeMutation = useCompleteInterviewSession(sessionId);
 
@@ -67,6 +100,8 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
   const [streamLog, setStreamLog] = useState<string[]>([]);
   const [streamError, setStreamError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [currentProcessStepId, setCurrentProcessStepId] = useState<ProcessStepId | null>(null);
+  const [processRuns, setProcessRuns] = useState<ProcessRun[]>([]);
   const [optimisticAnswer, setOptimisticAnswer] = useState<OptimisticAnswer | null>(null);
   const [streamingQuestionText, setStreamingQuestionText] = useState('');
   const [pendingStreamContent, setPendingStreamContent] = useState('');
@@ -74,10 +109,10 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
   const [pendingNextQuestion, setPendingNextQuestion] = useState<InterviewQuestionSnapshot | null>(null);
 
   const autoDraftEnabledRef = useRef(false);
+  const activeProcessRunIdRef = useRef<string | null>(null);
   const pendingStreamContentRef = useRef('');
 
   const session = sessionQuery.data;
-  const report = reportQuery.data;
 
   useEffect(() => {
     if (!sessionId) {
@@ -102,7 +137,6 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
   const activeQuestion = pendingNextQuestion ?? currentQuestion;
   const canAnswer = Boolean(session && !session.completed && activeQuestion);
   const isInterviewFinished = Boolean(session?.completed);
-  const shouldShowReport = Boolean(session?.completed || report?.status === 'generated' || report?.status === 'failed');
 
   useEffect(() => {
     if (!optimisticAnswer || !session?.answers?.length) {
@@ -121,6 +155,15 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
   useEffect(() => {
     pendingStreamContentRef.current = pendingStreamContent;
   }, [pendingStreamContent]);
+
+  useEffect(() => {
+    const persistedRuns = buildProcessRunsFromAnswers(session?.answers ?? []);
+    if (persistedRuns.length === 0) {
+      return;
+    }
+
+    setProcessRuns((current) => mergeProcessRuns(current, persistedRuns));
+  }, [session?.answers]);
 
   useEffect(() => {
     if (!pendingNextQuestion || !pendingStreamContent) {
@@ -183,6 +226,141 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
     [answerText, canAnswer, activeQuestion?.question_key]
   );
 
+  function updateActiveProcessStep({
+    stepId,
+    label,
+    detail,
+    status,
+    toolSummary
+  }: {
+    stepId: ProcessStepId;
+    label: string;
+    detail?: string;
+    status: ProcessStepStatus;
+    toolSummary?: ProcessToolSummary;
+  }) {
+    const runId = activeProcessRunIdRef.current;
+    if (!runId) {
+      return;
+    }
+
+    setProcessRuns((current) =>
+      current.map((run) => {
+        if (run.id !== runId) {
+          return run;
+        }
+
+        const existingStep = run.steps.find((step) => step.id === stepId);
+        const nextSteps =
+          status === 'active'
+            ? run.steps.map((step) =>
+                step.status === 'active' && step.id !== stepId ? { ...step, status: 'completed' as const } : step
+              )
+            : [...run.steps];
+        const nextStep: ProcessStep = {
+          id: stepId,
+          label,
+          detail: detail || existingStep?.detail,
+          status,
+          toolSummary: toolSummary || existingStep?.toolSummary,
+          timestamp: existingStep?.timestamp ?? Date.now()
+        };
+
+        if (existingStep) {
+          return {
+            ...run,
+            steps: nextSteps.map((step) => (step.id === stepId ? nextStep : step))
+          };
+        }
+
+        return {
+          ...run,
+          steps: [...nextSteps, nextStep]
+        };
+      })
+    );
+  }
+
+  function failActiveProcessRun(message: string) {
+    const runId = activeProcessRunIdRef.current;
+    if (!runId) {
+      return;
+    }
+
+    setProcessRuns((current) =>
+      current.map((run) => {
+        if (run.id !== runId) {
+          return run;
+        }
+
+        const activeStep = run.steps.find((step) => step.status === 'active') ?? run.steps[run.steps.length - 1];
+        const failedStepId = activeStep?.id ?? 'submit';
+        const failedStep: ProcessStep = {
+          id: failedStepId,
+          label: activeStep?.label ?? '提交答案',
+          detail: message,
+          status: 'failed',
+          toolSummary: activeStep?.toolSummary,
+          timestamp: activeStep?.timestamp ?? Date.now()
+        };
+        const hasFailedStep = run.steps.some((step) => step.id === failedStepId);
+
+        return {
+          ...run,
+          status: 'failed',
+          steps: hasFailedStep
+            ? run.steps.map((step) => (step.id === failedStepId ? failedStep : step))
+            : [...run.steps, failedStep]
+        };
+      })
+    );
+    activeProcessRunIdRef.current = null;
+    setCurrentProcessStepId(null);
+  }
+
+  function completeActiveProcessRun() {
+    const runId = activeProcessRunIdRef.current;
+    if (!runId) {
+      return;
+    }
+
+    setProcessRuns((current) =>
+      current.map((run) =>
+        run.id === runId
+          ? {
+              ...run,
+              status: 'completed',
+              collapsed: true,
+              steps: [
+                ...run.steps.map((step) =>
+                  step.status === 'active' ? { ...step, status: 'completed' as const } : step
+                ),
+                ...(run.steps.some((step) => step.id === 'done')
+                  ? []
+                  : [
+                      {
+                        id: 'done' as const,
+                        label: '本轮完成',
+                        detail: '当前轮流式流程已结束，可以继续作答或查看结果。',
+                        status: 'completed' as const,
+                        timestamp: Date.now()
+                      }
+                    ])
+              ]
+            }
+          : run
+      )
+    );
+    activeProcessRunIdRef.current = null;
+    setCurrentProcessStepId(null);
+  }
+
+  function toggleProcessRunCollapsed(runId: string) {
+    setProcessRuns((current) =>
+      current.map((run) => (run.id === runId ? { ...run, collapsed: !run.collapsed } : run))
+    );
+  }
+
   async function handleSubmitAnswer() {
     if (!activeQuestion || !answerText.trim()) {
       return;
@@ -190,8 +368,11 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
 
     const submittedQuestion = activeQuestion;
     const submittedAnswer = answerText.trim();
+    const processRunId = `${submittedQuestion.question_key ?? 'round'}-${submittedQuestion.round_index}-${Date.now()}`;
 
     setIsSubmitting(true);
+    setCurrentProcessStepId('submit');
+    activeProcessRunIdRef.current = processRunId;
     setDraftMessage('');
     setStreamError('');
     setStreamLog([]);
@@ -204,6 +385,25 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
     setPendingStreamContent('');
     setClosingMessage('');
     setStreamingQuestionText('');
+    setProcessRuns((current) => [
+      ...current,
+      {
+        id: processRunId,
+        questionKey: submittedQuestion.question_key,
+        roundIndex: submittedQuestion.round_index,
+        status: 'running',
+        collapsed: false,
+        steps: [
+          {
+            id: 'submit',
+            label: '提交答案',
+            detail: '答案已发送到服务端，正在进入本轮处理流程。',
+            status: 'completed',
+            timestamp: Date.now()
+          }
+        ]
+      }
+    ]);
     setAnswerText('');
 
     try {
@@ -212,14 +412,18 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
         {
           answer_text: submittedAnswer,
           question_key: submittedQuestion.question_key,
-          answer_metadata: {}
+          answer_metadata: {
+            process_run_id: processRunId
+          }
         },
         {
           onEvent: (event) => {
             handleStreamEvent(event);
           },
           onError: (error) => {
-            setStreamError(error instanceof Error ? error.message : '流式请求失败');
+            const message = error instanceof Error ? error.message : '流式请求失败';
+            setStreamError(message);
+            failActiveProcessRun(message);
           }
         }
       );
@@ -231,7 +435,9 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
     } catch (error) {
       setOptimisticAnswer(null);
       setAnswerText(submittedAnswer);
-      setStreamError(error instanceof Error ? error.message : '提交失败，请稍后重试');
+      const message = error instanceof Error ? error.message : '提交失败，请稍后重试';
+      setStreamError(message);
+      failActiveProcessRun(message);
     } finally {
       setIsSubmitting(false);
     }
@@ -239,11 +445,19 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
 
   function handleStreamEvent(event: InterviewStreamEvent) {
     if (event.type === 'status') {
-      setStreamLog((current) => [...current, `状态：${event.message}`]);
+      applyStatusStageToProcess(event, updateActiveProcessStep, setCurrentProcessStepId);
+      setStreamLog((current) => [...current, formatStatusLog(event)]);
       return;
     }
 
     if (event.type === 'plan') {
+      updateActiveProcessStep({
+        stepId: 'replan',
+        label: '判断下一步动作',
+        detail: `推进决策：${event.action ?? 'unknown'}${event.reason ? ` · ${event.reason}` : ''}`,
+        status: 'completed'
+      });
+      setCurrentProcessStepId('llm');
       setStreamLog((current) => [
         ...current,
         `推进决策：${event.action ?? 'unknown'}${event.reason ? ` · ${event.reason}` : ''}`
@@ -253,6 +467,13 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
 
     if (event.type === 'content') {
       const contentEvent = event as InterviewContentEvent;
+      updateActiveProcessStep({
+        stepId: 'llm',
+        label: '生成下一题 / 结束语',
+        detail: '面试官已生成下一步内容，正在保存本轮结果。',
+        status: 'completed'
+      });
+      setCurrentProcessStepId('persist');
       setPendingStreamContent(contentEvent.content);
       setClosingMessage('');
       setStreamLog((current) => [...current, '本轮回答已处理，正在生成下一条提问。']);
@@ -261,6 +482,13 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
 
     if (event.type === 'step_complete') {
       const stepEvent = event as InterviewStepCompleteEvent;
+      updateActiveProcessStep({
+        stepId: 'persist',
+        label: '保存本轮结果',
+        detail: stepEvent.response.message,
+        status: 'completed'
+      });
+      setCurrentProcessStepId(stepEvent.response.completed ? 'report' : 'done');
       if (stepEvent.response.completed) {
         setPendingNextQuestion(null);
         setStreamingQuestionText('');
@@ -275,6 +503,13 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
     }
 
     if (event.type === 'report') {
+      updateActiveProcessStep({
+        stepId: 'report',
+        label: '生成统一评估报告',
+        detail: '统一评估报告已生成，正在刷新最终结果。',
+        status: 'completed'
+      });
+      setCurrentProcessStepId('done');
       setStreamLog((current) => [...current, '统一评估报告已生成，正在刷新最终结果。']);
       void queryClient.invalidateQueries({ queryKey: ['interview', 'report', sessionId] });
       void queryClient.invalidateQueries({ queryKey: ['interview', 'report-export', sessionId] });
@@ -282,13 +517,16 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
     }
 
     if (event.type === 'done') {
+      completeActiveProcessRun();
       setStreamLog((current) => [...current, '当前轮流式流程已结束。']);
       return;
     }
 
     if (event.type === 'error') {
       const errorEvent = event as InterviewErrorEvent;
-      setStreamError(`${errorEvent.message} (code: ${errorEvent.code})`);
+      const message = `${errorEvent.message} (code: ${errorEvent.code})`;
+      setStreamError(message);
+      failActiveProcessRun(message);
     }
   }
 
@@ -309,17 +547,12 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
         pendingNextQuestion,
         streamingQuestionText,
         optimisticAnswer,
-        closingMessage
+        closingMessage,
+        false
       ),
-    [session?.answers, currentQuestion, pendingNextQuestion, streamingQuestionText, optimisticAnswer, closingMessage]
+    [session?.answers, currentQuestion, pendingNextQuestion, streamingQuestionText, optimisticAnswer, closingMessage, isSubmitting, pendingStreamContent]
   );
-
-  const reportSummary = useMemo(() => buildReportSummary(report), [report]);
-  const reportStrengths = normalizeStringList(report?.strengths);
-  const reportWeaknesses = normalizeStringList(report?.weaknesses);
-  const reportSuggestions = normalizeStringList(report?.suggestions);
-  const reportQuestionEvaluations = normalizeQuestionEvaluations(report?.question_evaluations);
-  const reportDimensionScores = normalizeDimensionScores(report?.dimension_scores);
+  const submitButtonLabel = getSubmitButtonLabel(isSubmitting, currentProcessStepId);
 
   return (
     <div className={styles.layout}>
@@ -359,11 +592,24 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
                 {chatMessages.length === 0 ? (
                   <FeedbackState title="等待题目" message="当前还没有可展示的问答记录。" />
                 ) : (
-                  chatMessages.map((message) => (
-                    <ChatBubble key={message.id} message={message} />
-                  ))
+                  renderChatTimeline(chatMessages, processRuns, toggleProcessRunCollapsed)
                 )}
               </div>
+
+              {streamLog.length > 0 ? (
+                <details className={styles.logDetails}>
+                  <summary>查看技术日志</summary>
+                  <div className={styles.logList}>
+                    {streamLog.map((item, index) => (
+                      <div key={`${item}-${index}`} className={styles.logItem}>
+                        {item}
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              ) : null}
+
+              {streamError ? <FeedbackState tone="error" title="流式过程异常" message={streamError} /> : null}
 
               {!isInterviewFinished ? (
                 <div className={styles.section}>
@@ -392,7 +638,7 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
                       type="button"
                       onClick={() => void handleSubmitAnswer()}
                     >
-                      {isSubmitting ? '提交中...' : '提交答案'}
+                      {submitButtonLabel}
                     </button>
                   </div>
 
@@ -408,133 +654,18 @@ export function InterviewSessionWorkspace({ sessionId }: InterviewSessionWorkspa
                 <FeedbackState
                   tone="success"
                   title="面试已完成"
-                  message="问答流程已经结束，统一评估报告会在下方展示。"
+                  message="问答流程已经结束，可以进入独立页面查看统一评估细则。"
+                  action={
+                    <Link className={styles.primaryButton} to={`/interview/${sessionId}/report`}>
+                      查看统一评估报告
+                    </Link>
+                  }
                 />
               )}
             </div>
           ) : null}
         </SectionCard>
 
-        <SectionCard
-          title="流式推进状态"
-          description="保留当前轮的服务端推进信息，便于排查 follow-up、切题和完成时机。"
-        >
-          <div className={styles.streamSection}>
-            {streamLog.length === 0 && !streamError ? (
-              <FeedbackState title="等待提交" message="提交答案后，这里会显示本轮的流式状态推进。" />
-            ) : (
-              <>
-                {streamLog.length > 0 ? (
-                  <div className={styles.logList}>
-                    {streamLog.map((item, index) => (
-                      <div key={`${item}-${index}`} className={styles.logItem}>
-                        {item}
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-
-                {streamError ? <FeedbackState tone="error" title="流式过程异常" message={streamError} /> : null}
-              </>
-            )}
-          </div>
-        </SectionCard>
-
-        {shouldShowReport ? (
-          <SectionCard
-            title="统一评估报告"
-            description="统一评估只在全部问题完成后展示，避免答题中途干扰当前面试。"
-          >
-            {reportQuery.isLoading ? (
-              <FeedbackState title="正在加载报告" message="报告状态与内容正在同步。" />
-            ) : reportQuery.isError ? (
-              <FeedbackState
-                tone="error"
-                title="报告加载失败"
-                message={reportQuery.error instanceof Error ? reportQuery.error.message : '请稍后重试'}
-              />
-            ) : report ? (
-              <div className={styles.reportSection}>
-                <div className={styles.reportMetaGrid}>
-                  <SnapshotCard label="报告状态" value={report.status} />
-                  <SnapshotCard label="总体评分" value={formatScore(report.overall_score)} />
-                  <SnapshotCard label="总体评级" value={report.overall_rating ?? '待生成'} />
-                  <SnapshotCard label="生成时间" value={formatDateTime(report.generated_at)} />
-                </div>
-
-                <FeedbackState
-                  tone={report.status === 'failed' ? 'error' : report.status === 'generated' ? 'success' : 'neutral'}
-                  title="报告摘要"
-                  message={
-                    report.error_message ||
-                    report.summary_text ||
-                    '统一评估报告尚未生成，请稍后刷新查看。'
-                  }
-                />
-
-                {reportSummary ? (
-                  <div className={styles.reportSummaryGrid}>
-                    <ReportList title="亮点" items={reportStrengths} />
-                    <ReportList title="短板" items={reportWeaknesses} />
-                    <ReportList title="建议" items={reportSuggestions} />
-                  </div>
-                ) : null}
-
-                {Object.keys(reportDimensionScores).length > 0 ? (
-                  <div className={styles.dimensionGrid}>
-                    {Object.entries(reportDimensionScores).map(([key, value]) => (
-                      <div key={key} className={styles.dimensionCard}>
-                        <span>{key}</span>
-                        <strong>{formatScore(value)}</strong>
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-
-                {reportQuestionEvaluations.length > 0 ? (
-                  <div className={styles.questionEvaluationList}>
-                    {reportQuestionEvaluations.map((item) => (
-                      <div key={item.question_key} className={styles.questionEvaluationCard}>
-                        <div className={styles.questionEvaluationHeader}>
-                          <strong>{item.question_key}</strong>
-                          <span>
-                            {item.rating} · {formatScore(item.score)}
-                          </span>
-                        </div>
-                        <p className={styles.questionEvaluationText}>{item.question_text}</p>
-                        <p className={styles.questionEvaluationMeta}>{item.rationale}</p>
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-
-                <div className={styles.section}>
-                  <h3 className={styles.sectionTitle}>Markdown 报告</h3>
-                  <MarkdownRenderer content={report.markdown_content} />
-                </div>
-
-                {exportQuery.data ? (
-                  <div className={styles.exportCard}>
-                    <strong>导出占位</strong>
-                    <span>文件名：{exportQuery.data.file_name}</span>
-                    <span>状态：{exportQuery.data.report_status}</span>
-                    <span>格式：{exportQuery.data.export_format}</span>
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-          </SectionCard>
-        ) : (
-          <SectionCard
-            title="统一评估报告"
-            description="统一评估报告会在所有问题都回答完毕后再出现。"
-          >
-            <FeedbackState
-              title="报告暂未开放"
-              message="当前仍在面试过程中。为避免干扰答题，报告区会在全部问答结束后再显示。"
-            />
-          </SectionCard>
-        )}
       </div>
     </div>
   );
@@ -545,23 +676,6 @@ function SnapshotCard({ label, value }: { label: string; value: string }) {
     <div className={styles.snapshotCard}>
       <span>{label}</span>
       <strong>{value}</strong>
-    </div>
-  );
-}
-
-function ReportList({ title, items }: { title: string; items: string[] }) {
-  if (items.length === 0) {
-    return null;
-  }
-
-  return (
-    <div className={styles.reportListCard}>
-      <h4>{title}</h4>
-      <ul>
-        {items.map((item) => (
-          <li key={item}>{item}</li>
-        ))}
-      </ul>
     </div>
   );
 }
@@ -587,13 +701,284 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   );
 }
 
+function renderChatTimeline(
+  messages: ChatMessage[],
+  processRuns: ProcessRun[],
+  onToggleProcessRun: (runId: string) => void
+) {
+  const renderedRunIds = new Set<string>();
+  const nodes = messages.map((message) => {
+    const matchedRuns =
+      message.role === 'user'
+        ? processRuns.filter(
+            (run) =>
+              !renderedRunIds.has(run.id) &&
+              run.questionKey === message.questionKey &&
+              run.roundIndex === message.roundIndex
+          )
+        : [];
+    matchedRuns.forEach((run) => renderedRunIds.add(run.id));
+
+    return (
+      <div key={`row-${message.id}`} className={styles.chatTimelineRow}>
+        <ChatBubble message={message} />
+        {matchedRuns.map((run) => (
+          <AssistantProcessBubble key={run.id} run={run} onToggle={() => onToggleProcessRun(run.id)} />
+        ))}
+      </div>
+    );
+  });
+
+  const danglingRuns = processRuns.filter((run) => !renderedRunIds.has(run.id));
+  if (danglingRuns.length > 0) {
+    nodes.push(
+      <div key="dangling-process-runs" className={styles.chatTimelineRow}>
+        {danglingRuns.map((run) => (
+          <AssistantProcessBubble key={run.id} run={run} onToggle={() => onToggleProcessRun(run.id)} />
+        ))}
+      </div>
+    );
+  }
+  return nodes;
+}
+
+function AssistantProcessBubble({ run, onToggle }: { run: ProcessRun; onToggle: () => void }) {
+  const kickerText =
+    run.status === 'completed' ? '面试官处理完成' : run.status === 'failed' ? '面试官处理异常' : '面试官正在处理';
+  const bubbleClass = [
+    styles.chatBubble,
+    styles.chatBubbleAssistant,
+    styles.processBubble,
+    styles[`processBubble_${run.status}`],
+    run.collapsed ? styles.processBubbleCollapsed : ''
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  return (
+    <article className={bubbleClass}>
+      <div className={styles.processHeader}>
+        <div>
+          <span className={styles.processKicker}>{kickerText}</span>
+          <strong>运行过程</strong>
+          {run.collapsed ? <span className={styles.processCollapsedHint}>已生成下方问题，可展开回顾处理细节。</span> : null}
+        </div>
+        <button className={styles.processToggle} type="button" onClick={onToggle}>
+          {run.collapsed ? '展开运行过程' : '收起运行过程'}
+        </button>
+      </div>
+
+      {!run.collapsed ? (
+        <div className={styles.processSteps}>
+          {run.steps.map((step) => (
+            <div key={step.id} className={`${styles.processStep} ${styles[`processStep_${step.status}`]}`}>
+              <span className={styles.processMarker} aria-hidden="true">
+                {step.status === 'active' ? <span className={styles.processSpinner} /> : getProcessStepMarker(step.status)}
+              </span>
+              <div className={styles.processStepBody}>
+                <span className={styles.processStepLabel}>{step.label}</span>
+                {step.detail ? <span className={styles.processStepDetail}>{step.detail}</span> : null}
+                {step.toolSummary ? <ProcessToolSummaryView tool={step.toolSummary} /> : null}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+function ProcessToolSummaryView({ tool }: { tool: ProcessToolSummary }) {
+  const matchedItems = [
+    ...(tool.matched_files ?? []),
+    ...(tool.matched_projects ?? []),
+    ...(tool.matched_skills ?? [])
+  ].filter(Boolean);
+
+  return (
+    <div className={styles.processToolDetail}>
+      <span>
+        工具：{tool.display_name ?? tool.name ?? '证据工具'}
+        {tool.source ? `，来源：${tool.source}` : ''}
+      </span>
+      {matchedItems.length > 0 ? (
+        <div className={styles.processToolMatches}>
+          {matchedItems.slice(0, 4).map((item) => (
+            <span key={item}>{item}</span>
+          ))}
+        </div>
+      ) : null}
+      {tool.retrieval_reason ? <small>检索说明：{tool.retrieval_reason}</small> : null}
+    </div>
+  );
+}
+
+function getProcessStepMarker(status: ProcessStepStatus) {
+  if (status === 'completed') {
+    return 'OK';
+  }
+  if (status === 'skipped') {
+    return 'skip';
+  }
+  if (status === 'failed') {
+    return '!';
+  }
+  return '';
+}
+
+function buildProcessRunsFromAnswers(answers: InterviewAnswerHistoryDto[]): ProcessRun[] {
+  return answers
+    .map((answer) => normalizePersistedProcessRun(answer.answer_metadata?.process_run))
+    .filter((run): run is ProcessRun => Boolean(run));
+}
+
+function normalizePersistedProcessRun(rawRun: unknown): ProcessRun | null {
+  if (!isRecord(rawRun)) {
+    return null;
+  }
+
+  const id = typeof rawRun.id === 'string' && rawRun.id.trim() ? rawRun.id : '';
+  const roundIndex = typeof rawRun.round_index === 'number' ? rawRun.round_index : Number(rawRun.round_index);
+  const status = normalizeProcessRunStatus(rawRun.status);
+  const rawSteps = Array.isArray(rawRun.steps) ? rawRun.steps : [];
+  const steps = rawSteps
+    .map((step) => normalizePersistedProcessStep(step))
+    .filter((step): step is ProcessStep => Boolean(step));
+
+  if (!id || !Number.isFinite(roundIndex) || steps.length === 0) {
+    return null;
+  }
+
+  return {
+    id,
+    questionKey: typeof rawRun.question_key === 'string' ? rawRun.question_key : null,
+    roundIndex,
+    status,
+    collapsed: status === 'completed',
+    steps
+  };
+}
+
+function normalizePersistedProcessStep(rawStep: unknown): ProcessStep | null {
+  if (!isRecord(rawStep) || !isProcessStepId(rawStep.id)) {
+    return null;
+  }
+
+  const status = normalizeProcessStepStatus(rawStep.status);
+  const timestamp = typeof rawStep.timestamp === 'number' ? rawStep.timestamp : Number(rawStep.timestamp);
+  return {
+    id: rawStep.id,
+    label: typeof rawStep.label === 'string' && rawStep.label.trim() ? rawStep.label : getDefaultProcessStepLabel(rawStep.id),
+    detail: typeof rawStep.detail === 'string' ? rawStep.detail : undefined,
+    status,
+    toolSummary: normalizeProcessToolSummary(rawStep.tool_summary),
+    timestamp: Number.isFinite(timestamp) ? timestamp : Date.now()
+  };
+}
+
+function mergeProcessRuns(currentRuns: ProcessRun[], persistedRuns: ProcessRun[]) {
+  const nextRuns = [...currentRuns];
+  for (const persistedRun of persistedRuns) {
+    const existingIndex = nextRuns.findIndex(
+      (run) =>
+        run.id === persistedRun.id ||
+        (run.questionKey === persistedRun.questionKey && run.roundIndex === persistedRun.roundIndex)
+    );
+
+    if (existingIndex < 0) {
+      nextRuns.push(persistedRun);
+      continue;
+    }
+
+    const existingRun = nextRuns[existingIndex];
+    if (existingRun.status === 'running' && persistedRun.status !== 'completed' && persistedRun.status !== 'failed') {
+      continue;
+    }
+
+    nextRuns[existingIndex] = {
+      ...persistedRun,
+      collapsed: existingRun.status === 'running' ? persistedRun.status === 'completed' : existingRun.collapsed
+    };
+  }
+  return nextRuns;
+}
+
+function normalizeProcessRunStatus(status: unknown): ProcessRun['status'] {
+  if (status === 'completed' || status === 'failed' || status === 'running') {
+    return status;
+  }
+  return 'completed';
+}
+
+function normalizeProcessStepStatus(status: unknown): ProcessStepStatus {
+  if (status === 'pending' || status === 'active' || status === 'completed' || status === 'skipped' || status === 'failed') {
+    return status;
+  }
+  return 'completed';
+}
+
+function normalizeProcessToolSummary(rawTool: unknown): ProcessToolSummary | undefined {
+  if (!isRecord(rawTool)) {
+    return undefined;
+  }
+
+  return {
+    name: typeof rawTool.name === 'string' ? rawTool.name : undefined,
+    display_name: typeof rawTool.display_name === 'string' ? rawTool.display_name : undefined,
+    source: typeof rawTool.source === 'string' ? rawTool.source : undefined,
+    summary: typeof rawTool.summary === 'string' ? rawTool.summary : undefined,
+    matched_files: normalizeStringList(rawTool.matched_files),
+    matched_projects: normalizeStringList(rawTool.matched_projects),
+    matched_skills: normalizeStringList(rawTool.matched_skills),
+    retrieval_reason: typeof rawTool.retrieval_reason === 'string' ? rawTool.retrieval_reason : null
+  };
+}
+
+function normalizeStringList(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isProcessStepId(value: unknown): value is ProcessStepId {
+  return (
+    value === 'submit' ||
+    value === 'observation' ||
+    value === 'replan' ||
+    value === 'tool_prepare' ||
+    value === 'tool_call' ||
+    value === 'llm' ||
+    value === 'persist' ||
+    value === 'report' ||
+    value === 'done'
+  );
+}
+
+function getDefaultProcessStepLabel(stepId: ProcessStepId) {
+  const labels: Record<ProcessStepId, string> = {
+    submit: '提交答案',
+    observation: '评估回答完整性',
+    replan: '判断下一步动作',
+    tool_prepare: '准备证据工具',
+    tool_call: '调用证据工具',
+    llm: '生成下一题 / 结束语',
+    persist: '保存本轮结果',
+    report: '生成统一评估报告',
+    done: '本轮完成'
+  };
+  return labels[stepId];
+}
+
 function buildChatMessages(
   answers: InterviewAnswerHistoryDto[],
   currentQuestion: InterviewQuestionSnapshot | null,
   pendingNextQuestion: InterviewQuestionSnapshot | null,
   streamingQuestionText: string,
   optimisticAnswer: OptimisticAnswer | null,
-  closingMessage: string
+  closingMessage: string,
+  waitingForAssistant: boolean
 ): ChatMessage[] {
   const messages: ChatMessage[] = [];
   const answeredQuestionKeys = new Set(answers.map((answer) => answer.question_key).filter(Boolean));
@@ -641,6 +1026,17 @@ function buildChatMessages(
     });
   }
 
+  if (waitingForAssistant && optimisticAnswer) {
+    messages.push({
+      id: `assistant-thinking-${optimisticAnswer.questionKey ?? optimisticAnswer.roundIndex}`,
+      role: 'assistant',
+      status: 'streaming',
+      questionKey: null,
+      roundIndex: optimisticAnswer.roundIndex,
+      content: '面试官正在分析你的回答，准备下一步问题...'
+    });
+  }
+
   if (pendingNextQuestion && pendingNextQuestion.question_key !== currentQuestion?.question_key) {
     messages.push({
       id: `pending-${pendingNextQuestion.question_key}`,
@@ -667,44 +1063,223 @@ function buildChatMessages(
   return messages;
 }
 
-function buildReportSummary(report: InterviewReportDto | undefined) {
-  if (!report) {
-    return false;
+function applyStatusStageToProcess(
+  event: InterviewStatusEvent,
+  updateStep: (step: {
+    stepId: ProcessStepId;
+    label: string;
+    detail?: string;
+    status: ProcessStepStatus;
+    toolSummary?: ProcessToolSummary;
+  }) => void,
+  setCurrentStepId: (stepId: ProcessStepId) => void
+) {
+  switch (event.stage) {
+    case 'session_loaded':
+    case 'answer_observation_start':
+      updateStep({
+        stepId: 'observation',
+        label: event.label ?? '评估回答完整性',
+        detail: event.detail ?? '正在判断当前回答是否覆盖本题关键观察点。',
+        status: 'active'
+      });
+      setCurrentStepId('observation');
+      return;
+    case 'answer_observation_complete':
+      updateStep({
+        stepId: 'observation',
+        label: event.label ?? '评估回答完整性',
+        detail: event.detail ?? '回答完整性评估已完成。',
+        status: 'completed'
+      });
+      setCurrentStepId('replan');
+      return;
+    case 'replan_start':
+      updateStep({
+        stepId: 'replan',
+        label: event.label ?? '判断下一步动作',
+        detail: event.detail ?? '正在判断需要追问、切换主题还是结束面试。',
+        status: 'active'
+      });
+      setCurrentStepId('replan');
+      return;
+    case 'replan_complete':
+      updateStep({
+        stepId: 'replan',
+        label: event.label ?? '判断下一步动作',
+        detail: event.detail ?? '下一步动作判断完成。',
+        status: 'completed'
+      });
+      setCurrentStepId('llm');
+      return;
+    case 'tool_prepare_start':
+      updateStep({
+        stepId: 'tool_prepare',
+        label: event.label ?? '准备证据工具',
+        detail: event.detail ?? '正在判断是否需要结合简历、GitHub 代码证据或其他工具结果。',
+        status: 'active'
+      });
+      setCurrentStepId('tool_prepare');
+      return;
+    case 'tool_call_start':
+      updateStep({
+        stepId: 'tool_prepare',
+        label: '准备证据工具',
+        detail: '证据工具上下文准备完成。',
+        status: 'completed'
+      });
+      updateStep({
+        stepId: 'tool_call',
+        label: event.label ?? '调用证据工具',
+        detail: event.detail ?? '正在调用证据工具补充追问上下文。',
+        status: 'active'
+      });
+      setCurrentStepId('tool_call');
+      return;
+    case 'tool_call_complete':
+      updateStep({
+        stepId: 'tool_prepare',
+        label: '准备证据工具',
+        detail: '证据工具上下文准备完成。',
+        status: 'completed'
+      });
+      updateStep({
+        stepId: 'tool_call',
+        label: event.label ?? '调用证据工具',
+        detail: buildToolStepDetail(event),
+        status: 'completed',
+        toolSummary: event.tool
+      });
+      setCurrentStepId('llm');
+      return;
+    case 'tool_skipped':
+      updateStep({
+        stepId: 'tool_prepare',
+        label: event.label ?? '本轮未调用证据工具',
+        detail: event.detail ?? event.message,
+        status: 'skipped'
+      });
+      setCurrentStepId('llm');
+      return;
+    case 'llm_generation_start':
+      updateStep({
+        stepId: 'llm',
+        label: event.label ?? '生成下一题 / 结束语',
+        detail: event.detail ?? '面试官正在组织下一条提问或收尾说明。',
+        status: 'active'
+      });
+      setCurrentStepId('llm');
+      return;
+    case 'llm_generation_complete':
+      updateStep({
+        stepId: 'llm',
+        label: event.label ?? '生成下一题 / 结束语',
+        detail: event.detail ?? '下一步内容已生成。',
+        status: 'completed'
+      });
+      setCurrentStepId('persist');
+      return;
+    case 'persist_start':
+      updateStep({
+        stepId: 'persist',
+        label: event.label ?? '保存本轮结果',
+        detail: event.detail ?? '正在保存答案、题目状态和流程结果。',
+        status: 'active'
+      });
+      setCurrentStepId('persist');
+      return;
+    case 'persist_complete':
+      updateStep({
+        stepId: 'persist',
+        label: event.label ?? '保存本轮结果',
+        detail: event.detail ?? '本轮答案和面试状态已保存。',
+        status: 'completed'
+      });
+      setCurrentStepId('done');
+      return;
+    case 'report_start':
+      updateStep({
+        stepId: 'report',
+        label: event.label ?? '生成统一评估报告',
+        detail: event.detail ?? '面试已结束，正在生成或刷新统一评估报告。',
+        status: 'active'
+      });
+      setCurrentStepId('report');
+      return;
+    case 'report_complete':
+      updateStep({
+        stepId: 'report',
+        label: event.label ?? '生成统一评估报告',
+        detail: event.detail ?? '统一评估报告已生成。',
+        status: 'completed'
+      });
+      setCurrentStepId('done');
+      return;
+    default:
+      if (event.message.includes('评估报告')) {
+        updateStep({
+          stepId: 'report',
+          label: event.label ?? '生成统一评估报告',
+          detail: event.detail ?? event.message,
+          status: 'active'
+        });
+        setCurrentStepId('report');
+      } else {
+        updateStep({
+          stepId: 'observation',
+          label: event.label ?? '评估回答完整性',
+          detail: event.detail ?? event.message,
+          status: 'active'
+        });
+        setCurrentStepId('observation');
+      }
   }
-
-  return (
-    normalizeStringList(report.strengths).length > 0 ||
-    normalizeStringList(report.weaknesses).length > 0 ||
-    normalizeStringList(report.suggestions).length > 0
-  );
 }
 
-function normalizeStringList(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
+function formatStatusLog(event: InterviewStatusEvent) {
+  if (event.stage || event.label || event.detail) {
+    return `状态：${event.label ?? event.message}${event.stage ? ` [${event.stage}]` : ''}${
+      event.detail ? ` · ${event.detail}` : ''
+    }`;
   }
-
-  return value.filter((item): item is string => typeof item === 'string' && item.length > 0);
+  return `状态：${event.message}`;
 }
 
-function normalizeQuestionEvaluations(value: unknown): InterviewReportDto['question_evaluations'] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.filter((item): item is InterviewReportDto['question_evaluations'][number] => {
-    return typeof item === 'object' && item !== null && typeof item.question_key === 'string';
-  });
+function buildToolStepDetail(event: InterviewStatusEvent) {
+  const tool = event.tool;
+  const matchedItems = [
+    ...(tool?.matched_files ?? []),
+    ...(tool?.matched_projects ?? []),
+    ...(tool?.matched_skills ?? [])
+  ].filter(Boolean);
+  const toolName = tool?.display_name ?? tool?.name ?? '证据工具';
+  const sourceText = tool?.source ? `，从 ${tool.source} 获取相关信息` : '';
+  const matchedText = matchedItems.length > 0 ? `，命中：${matchedItems.slice(0, 3).join('、')}` : '';
+  return tool?.summary || event.detail || `已调用${toolName}${sourceText}${matchedText}。`;
 }
 
-function normalizeDimensionScores(value: unknown): Record<string, number> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
+function getSubmitButtonLabel(isSubmitting: boolean, currentStepId: string | null) {
+  if (!isSubmitting) {
+    return '提交答案';
   }
 
-  const entries = Object.entries(value as Record<string, unknown>).filter((entry): entry is [string, number] => {
-    return typeof entry[1] === 'number' && Number.isFinite(entry[1]);
-  });
-
-  return Object.fromEntries(entries);
+  if (currentStepId === 'observation' || currentStepId === 'replan') {
+    return '分析回答中...';
+  }
+  if (currentStepId === 'tool_prepare') {
+    return '准备工具中...';
+  }
+  if (currentStepId === 'tool_call') {
+    return '检索证据中...';
+  }
+  if (currentStepId === 'llm') {
+    return '生成下一题中...';
+  }
+  if (currentStepId === 'report') {
+    return '生成报告中...';
+  }
+  if (currentStepId === 'persist' || currentStepId === 'done') {
+    return '保存结果中...';
+  }
+  return '提交中...';
 }

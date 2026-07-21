@@ -61,8 +61,16 @@ def test_interview_sse_terminal_demo_for_next_question(
 
     payloads = _print_stream_trace("正常回答 -> 下一题", raw_lines)
     payload_types = [payload["type"] for payload in payloads]
+    status_stages = [payload.get("stage") for payload in payloads if payload["type"] == "status"]
 
-    assert payload_types == ["status", "plan", "content", "step_complete", "done"]
+    assert "plan" in payload_types
+    assert "content" in payload_types
+    assert "step_complete" in payload_types
+    assert payload_types[-1] == "done"
+    assert "answer_observation_start" in status_stages
+    assert "replan_start" in status_stages
+    assert "llm_generation_start" in status_stages
+    assert "persist_complete" in status_stages
     assert payloads[-1]["session"]["current_question"]["question_key"] == "q-2"
 
 
@@ -91,6 +99,16 @@ def test_interview_sse_terminal_demo_for_follow_up(
 
     payloads = _print_stream_trace("简短回答 -> 追问", raw_lines)
     payload_types = [payload["type"] for payload in payloads]
+    status_stages = [payload.get("stage") for payload in payloads if payload["type"] == "status"]
 
-    assert payload_types == ["status", "plan", "content", "step_complete", "done"]
+    assert "plan" in payload_types
+    assert "content" in payload_types
+    assert "step_complete" in payload_types
+    assert payload_types[-1] == "done"
+    assert "answer_observation_start" in status_stages
+    assert "replan_start" in status_stages
+    assert "tool_prepare_start" in status_stages
+    assert any(stage in status_stages for stage in ["tool_call_complete", "tool_skipped"])
+    assert "llm_generation_start" in status_stages
+    assert "persist_complete" in status_stages
     assert payloads[-1]["session"]["current_question"]["question_key"] == "q-1-f-1"

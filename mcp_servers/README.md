@@ -24,6 +24,16 @@
 - `search_historical_tickets` - 历史工单查询
 - `get_service_info` / `list_all_services` - 服务信息
 
+### GitHub MCP Server（官方外部服务）
+**GitHub 仓库上下文服务** - 推荐使用官方 `github/github-mcp-server`
+
+当前项目不在仓库内自研 GitHub MCP Server，而是通过 `app.config.McpSettings`
+将官方服务注册进统一 MCP 客户端。默认推荐：
+
+- 使用本地 `stdio` 模式，而不是远程 HTTP 模式
+- 使用 `GITHUB_PERSONAL_ACCESS_TOKEN` 进行认证
+- 使用 `GITHUB_TOOLSETS=repos` 限制能力范围，避免工具上下文膨胀
+
 ## 🚀 快速开始
 
 ### 安装依赖
@@ -45,6 +55,40 @@ make mcp-status  # 查看服务状态
 python mcp_servers/cls_server.py
 python mcp_servers/monitor_server.py
 ```
+
+### GitHub MCP Server 接入（WSL 推荐）
+1. 安装官方 GitHub MCP Server，并确保 `github-mcp-server` 可执行文件在 PATH 中
+2. 配置环境变量
+
+```bash
+export MCP__GITHUB__ENABLED=true
+export MCP__GITHUB__TRANSPORT=stdio
+export MCP__GITHUB__COMMAND=github-mcp-server
+export MCP__GITHUB__ARGS='["stdio"]'
+export MCP__GITHUB__PAT='ghp_your_token'
+export MCP__GITHUB__TOOLSETS='repos'
+```
+
+3. 启动项目后，`app/agent/mcp_client.py` 会把 GitHub MCP Server 一并注册到 `MultiServerMCPClient`
+
+### 可选手工验收
+在 WSL 的 `biz_agent` 环境中执行一个简单连通性检查：
+
+```bash
+python - <<'PY'
+import asyncio
+from app.agent.mcp_client import get_mcp_client_with_retry
+
+async def main():
+    client = await get_mcp_client_with_retry(force_new=True)
+    tools = await client.get_tools()
+    print([getattr(tool, "name", str(tool)) for tool in tools if "github" in getattr(tool, "name", "").lower()])
+
+asyncio.run(main())
+PY
+```
+
+若配置正确，应能看到 GitHub 相关工具名称，并且能力范围受 `repos` toolset 限制。
 
 ## 💡 使用示例
 

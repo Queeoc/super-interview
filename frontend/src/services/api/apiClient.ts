@@ -107,6 +107,29 @@ function post<TResponse, TRequest = unknown>(
   });
 }
 
+function patch<TResponse, TRequest = unknown>(
+  path: string,
+  body?: TRequest,
+  options: Omit<RequestOptions, 'method' | 'body'> = {}
+) {
+  return request<TResponse>(path, {
+    ...options,
+    method: 'PATCH',
+    body: body === undefined ? null : JSON.stringify(body)
+  });
+}
+
+function del<TResponse>(
+  path: string,
+  options: Omit<RequestOptions, 'method' | 'body'> = {}
+) {
+  return request<TResponse>(path, {
+    ...options,
+    method: 'DELETE',
+    body: null
+  });
+}
+
 function upload<TResponse>(
   path: string,
   formData: FormData,
@@ -123,6 +146,8 @@ export const apiClient = {
   request,
   get,
   post,
+  patch,
+  delete: del,
   upload,
   buildUrl
 };

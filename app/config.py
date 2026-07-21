@@ -6,17 +6,18 @@ architecture while preserving legacy flat accessors used by the current code.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote_plus
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def _coerce_boolish(value: Any) -> Any:
-    """Convert common environment string variants into booleans."""
+    """将外部环境输入的各种字符串变体安全地转换为 Python 布尔值。"""
 
     if isinstance(value, bool) or value is None:
         return value
@@ -31,15 +32,44 @@ def _coerce_boolish(value: Any) -> Any:
     return value
 
 
+def _coerce_string_listish(value: Any) -> Any:
+    """将环境变量中的列表值安全转换为字符串列表。"""
+
+    if value is None or isinstance(value, list):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return []
+        if normalized.startswith("["):
+            try:
+                parsed = json.loads(normalized)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        return [item.strip() for item in normalized.split(",") if item.strip()]
+
+    return value
+
+
 class SectionSettings(BaseSettings):
-    """Shared base class for environment-backed settings sections."""
+    """
+    配置板块基类（环境配置脚手架）
+    
+    作用:
+        1. 统一封装所有配置子类的底层读取规则，避免代码冗余(DRY原则)。
+        2. 自动从项目根目录的 .env 文件或系统环境变量中加载配置。
+        3. 提供跨平台的 UTF-8 编码支持、大小写不敏感容错，并自动忽略无关的干扰环境变量。
+    """
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
-    )
+    )   
 
 
 class AppSettings(SectionSettings):
@@ -74,6 +104,24 @@ class AppSettings(SectionSettings):
         return _coerce_boolish(value)
 
 
+class AdminSettings(SectionSettings):
+    """管理员入口的最小运行时配置。"""
+
+    enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("ADMIN__ENABLED", "ADMIN_ENABLED"),
+    )
+    token: str = Field(
+        default="",
+        validation_alias=AliasChoices("ADMIN__TOKEN", "ADMIN_TOKEN"),
+    )
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def normalize_enabled(cls, value: Any) -> Any:
+        return _coerce_boolish(value)
+
+
 class LlmSettings(SectionSettings):
     """LLM provider settings."""
 
@@ -99,7 +147,7 @@ class LlmSettings(SectionSettings):
             "LLM__EMBEDDING_MODEL",
             "DASHSCOPE_EMBEDDING_MODEL",
         ),
-    )
+    )   
     request_timeout_seconds: int = Field(
         default=60,
         validation_alias=AliasChoices(
@@ -188,15 +236,17 @@ class PostgresSettings(SectionSettings):
         ),
     )
 
+    '''在读取配置时，把 enabled 和 echo 这两个字段的值，先统一转换成布尔值格式。'''
     @field_validator("enabled", "echo", mode="before")
     @classmethod
     def normalize_bools(cls, value: Any) -> Any:
         return _coerce_boolish(value)
 
+    '''动态拼接 URL'''
     @property
     def async_url(self) -> str:
-        """Build the async SQLAlchemy connection URL."""
-
+        """动态计算属性：安全拼接 SQLAlchemy 异步连接串"""
+        # 对账号密码进行 URL 百分号转义，防止密码中的 '@' 破坏 URL 结构
         user = quote_plus(self.user)
         password = quote_plus(self.password)
         host = self.host
@@ -466,13 +516,13 @@ class StorageSettings(SectionSettings):
 
     @property
     def resolved_base_dir(self) -> Path:
-        """Return the absolute base directory for local storage."""
+        """动态计算属性：获取本地文件存储的【绝对路径】。"""
 
         return Path(self.base_dir).resolve()
 
     @property
     def resolved_temp_dir(self) -> Path:
-        """Return the absolute temp directory for local storage."""
+        """动态计算属性：获取本地临时缓存文件存储的【绝对路径】"""
 
         return Path(self.temp_dir).resolve()
 
@@ -506,7 +556,7 @@ class InterviewSettings(SectionSettings):
         validation_alias=AliasChoices("INTERVIEW__MAX_ROUNDS", "INTERVIEW_MAX_ROUNDS"),
     )
     max_follow_up_questions: int = Field(
-        default=2,
+        default=5,
         validation_alias=AliasChoices(
             "INTERVIEW__MAX_FOLLOW_UP_QUESTIONS",
             "INTERVIEW_MAX_FOLLOW_UP_QUESTIONS",
@@ -598,6 +648,32 @@ class RagSettings(SectionSettings):
         return _coerce_boolish(value)
 
 
+class McpServerConfig(BaseModel):
+    """统一的 MCP 服务端运行时描述。"""
+
+    transport: str = Field(..., description="MCP 传输方式")
+    url: str | None = Field(default=None, description="HTTP MCP 服务地址")
+    command: str | None = Field(default=None, description="stdio MCP 启动命令")
+    args: list[str] = Field(default_factory=list, description="stdio MCP 启动参数")
+    env: dict[str, str] = Field(default_factory=dict, description="stdio MCP 环境变量")
+
+    def to_runtime_dict(self) -> dict[str, Any]:
+        """转换为 MultiServerMCPClient 可消费的配置字典。"""
+
+        payload: dict[str, Any] = {
+            "transport": self.transport,
+        }
+        if self.url:
+            payload["url"] = self.url
+        if self.command:
+            payload["command"] = self.command
+        if self.args:
+            payload["args"] = list(self.args)
+        if self.env:
+            payload["env"] = dict(self.env)
+        return payload
+
+
 class McpSettings(SectionSettings):
     """MCP server settings kept for current runtime compatibility."""
 
@@ -617,27 +693,102 @@ class McpSettings(SectionSettings):
         default="http://localhost:8004/mcp",
         validation_alias=AliasChoices("MCP__MONITOR__URL", "MCP_MONITOR_URL"),
     )
+    github_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("MCP__GITHUB__ENABLED", "MCP_GITHUB_ENABLED"),
+    )
+    github_transport: str = Field(
+        default="stdio",
+        validation_alias=AliasChoices("MCP__GITHUB__TRANSPORT", "MCP_GITHUB_TRANSPORT"),
+    )
+    github_command: str = Field(
+        default="github-mcp-server",
+        validation_alias=AliasChoices("MCP__GITHUB__COMMAND", "MCP_GITHUB_COMMAND"),
+    )
+    github_args: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["stdio"],
+        validation_alias=AliasChoices("MCP__GITHUB__ARGS", "MCP_GITHUB_ARGS"),
+    )
+    github_pat: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "MCP__GITHUB__PAT",
+            "MCP_GITHUB_PAT",
+            "GITHUB_PERSONAL_ACCESS_TOKEN",
+        ),
+    )
+    github_toolsets: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["repos"],
+        validation_alias=AliasChoices("MCP__GITHUB__TOOLSETS", "MCP_GITHUB_TOOLSETS"),
+    )
+
+    @field_validator("github_enabled", mode="before")
+    @classmethod
+    def normalize_github_enabled(cls, value: Any) -> Any:
+        return _coerce_boolish(value)
+
+    @field_validator("github_args", "github_toolsets", mode="before")
+    @classmethod
+    def normalize_github_list_fields(cls, value: Any) -> Any:
+        return _coerce_string_listish(value)
+
+    def _build_http_server_config(self, *, transport: str, url: str) -> dict[str, Any]:
+        """构建基于 HTTP 的 MCP 服务配置。"""
+
+        return McpServerConfig(
+            transport=transport,
+            url=url,
+        ).to_runtime_dict()
+
+    def _build_github_server_config(self) -> dict[str, Any] | None:
+        """构建 GitHub MCP Server 配置；若缺少必要凭据则返回空。"""
+
+        if not self.github_enabled:
+            return None
+
+        github_pat = self.github_pat.strip()
+        if not github_pat:
+            return None
+
+        github_env = {
+            "GITHUB_PERSONAL_ACCESS_TOKEN": github_pat,
+        }
+        normalized_toolsets = [item.strip() for item in self.github_toolsets if item.strip()]
+        if normalized_toolsets:
+            github_env["GITHUB_TOOLSETS"] = ",".join(normalized_toolsets)
+
+        return McpServerConfig(
+            transport=self.github_transport,
+            command=self.github_command.strip() or "github-mcp-server",
+            args=[item.strip() for item in self.github_args if item.strip()],
+            env=github_env,
+        ).to_runtime_dict()
 
     @property
-    def servers(self) -> dict[str, dict[str, str]]:
+    def servers(self) -> dict[str, dict[str, Any]]:
         """Return the MCP server mapping expected by the current client."""
 
-        return {
-            "cls": {
-                "transport": self.cls_transport,
-                "url": self.cls_url,
-            },
-            "monitor": {
-                "transport": self.monitor_transport,
-                "url": self.monitor_url,
-            },
+        server_map: dict[str, dict[str, Any]] = {
+            "cls": self._build_http_server_config(
+                transport=self.cls_transport,
+                url=self.cls_url,
+            ),
+            "monitor": self._build_http_server_config(
+                transport=self.monitor_transport,
+                url=self.monitor_url,
+            ),
         }
+        github_server = self._build_github_server_config()
+        if github_server is not None:
+            server_map["github"] = github_server
+        return server_map
 
 
 class Settings(BaseModel):
     """Root project settings grouped by target architecture domains."""
 
     app: AppSettings = Field(default_factory=AppSettings)
+    admin: AdminSettings = Field(default_factory=AdminSettings)
     llm: LlmSettings = Field(default_factory=LlmSettings)
     milvus: MilvusSettings = Field(default_factory=MilvusSettings)
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)

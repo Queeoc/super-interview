@@ -55,6 +55,18 @@ class InterviewPersistenceService:
         repository = self._resolve_repository(session)
         return await repository.add_answer(answer)
 
+    async def update_answer_metadata(
+        self,
+        session: AsyncSession,
+        *,
+        answer_id: str,
+        metadata: dict,
+    ) -> InterviewAnswerEntity | None:
+        """更新答案元数据。"""
+
+        repository = self._resolve_repository(session)
+        return await repository.update_answer_metadata(answer_id, metadata)
+
     async def save_report(
         self,
         session: AsyncSession,

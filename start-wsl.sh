@@ -158,7 +158,7 @@ echo ""
 
 # ── Upload docs ─────────────────────────────────────────────
 # echo "[上传] 上传文档到向量数据库..."
-# for f in aiops-docs/*.md; do
+# for f in knowledge_base/rubrics/*.md; do
 #     if [ -f "$f" ]; then
 #         printf "  上传: %s\n" "$(basename "$f")"
 #         curl -s -X POST http://localhost:9900/api/upload -F "file=@$f" >/dev/null

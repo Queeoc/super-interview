@@ -14,10 +14,11 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict
 import pytest
 
-from app.agent.evaluator.batch_evaluator import BatchEvaluator
+from app.agent.evaluator.batch_evaluator import BatchEvaluator, _BatchQuestionEvaluationOutput
 from app.agent.evaluator.summarizer import InterviewSummarizer
 from app.agent.interview.executor import InterviewExecutor
-from app.agent.interview.planner import InterviewPlanner
+from app.agent.interview.plan_observer import InterviewPlanObserver
+from app.agent.interview.planner import InterviewPlanner, _PlannedQuestionItem
 from app.agent.interview.replanner import InterviewReplanner
 from app.api import interview as interview_api
 from app.core.database import get_db_session
@@ -446,6 +447,14 @@ async def test_summarizer_accepts_legacy_summary_shape() -> None:
     assert summary["summary_text"] == "整体表现较稳，但细节说明仍可加强。"
     assert summary["strengths"] == ["表达整体清晰"]
     assert summary["dimension_scores"]["technical_depth"] == 78.0
+    assert set(summary["dimension_scores"]) == {
+        "project_experience",
+        "technical_depth",
+        "skill_match",
+        "content_completeness",
+        "communication_clarity",
+    }
+    assert "implementation_clarity" not in summary["dimension_scores"]
 
 
 @pytest.mark.asyncio
@@ -534,6 +543,7 @@ def _build_test_service() -> tuple[InterviewService, _InMemoryInterviewRepositor
         repository_factory=lambda _session: repository,  # type: ignore[arg-type]
         prompt_runner=prompt_runner,
         planner=InterviewPlanner(prompt_runner),
+        plan_observer=InterviewPlanObserver(prompt_runner),
         executor=InterviewExecutor(prompt_runner),
         replanner=InterviewReplanner(prompt_runner),
         cache=InterviewSessionCache(redis_backend=redis_backend),
@@ -545,3 +555,48 @@ def _build_test_service() -> tuple[InterviewService, _InMemoryInterviewRepositor
     )
     session = AsyncMock()
     return service, repository, session, redis_backend
+
+
+def test_planned_question_item_normalizes_comma_separated_sequence_fields() -> None:
+    """planner schema 应兼容逗号分隔字符串。"""
+
+    item = _PlannedQuestionItem.model_validate(
+        {
+            "category_key": "PROJECT",
+            "question_text": "请介绍一个你长期维护的项目。",
+            "intent": "考察项目设计与维护。",
+            "must_observe_signals": "implementation details, tradeoffs，results",
+            "follow_up_focus": "bottlenecks、failure handling\nwhy this design",
+            "completion_criteria": ["candidate explains what they built, candidate explains outcomes"],
+            "priority": 1,
+            "can_skip": False,
+        }
+    )
+
+    assert item.must_observe_signals == ["implementation details", "tradeoffs", "results"]
+    assert item.follow_up_focus == ["bottlenecks", "failure handling", "why this design"]
+    assert item.completion_criteria == [
+        "candidate explains what they built",
+        "candidate explains outcomes",
+    ]
+
+
+def test_batch_question_evaluation_output_normalizes_sequence_fields() -> None:
+    """batch evaluator schema 应拆分字符串数组并补齐默认 rationale。"""
+
+    output = _BatchQuestionEvaluationOutput.model_validate(
+        {
+            "question_key": "q-1",
+            "score": 85,
+            "rating": "good",
+            "strengths": "思路清晰, 有实现细节",
+            "weaknesses": "边界情况展开不足，监控细节不够",
+            "suggestions": "补充故障处理、说明压测结果",
+            "rationale": "",
+        }
+    )
+
+    assert output.strengths == ["思路清晰", "有实现细节"]
+    assert output.weaknesses == ["边界情况展开不足", "监控细节不够"]
+    assert output.suggestions == ["补充故障处理", "说明压测结果"]
+    assert output.rationale == "基于回答内容给出综合评估。"

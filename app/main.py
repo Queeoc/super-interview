@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
-from app.api import aiops, chat, file, health, interview, knowledge, provider, resume, skill
+from app.api import admin_knowledge, chat, file, health, interview, knowledge, provider, resume, skill
 from app.config import config
 from app.core.database import database_manager
 from app.core.milvus_client import milvus_manager
@@ -29,7 +26,14 @@ setup_logger()
 
 
 async def _initialize_infrastructure() -> None:
-    """初始化共享基础设施。"""
+    """
+    异步初始化共享基础设施流水线。
+    
+    核心逻辑:
+        1. 依次异步/同步连接核心组件：Storage -> PostgreSQL -> Redis -> Milvus 向量库。
+        2. 严格的故障Fail-Fast防御：任何一个基础设施连接失败，立即捕获并将其包装为
+           带标准业务错误码(ErrorCode)的 InfrastructureException 并抛出，强行中断程序启动。
+    """
 
     try:
         await storage_manager.connect()
@@ -82,8 +86,8 @@ async def _shutdown_infrastructure() -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """应用生命周期管理。"""
+async def lifespan(_: FastAPI):
+    """管理应用生命周期。"""
 
     setup_logger()
     logger.info("=" * 60)
@@ -127,23 +131,17 @@ app.include_router(health.router, tags=["健康检查"])
 app.include_router(chat.router, prefix="/api", tags=["对话"])
 app.include_router(file.router, prefix="/api", tags=["文件管理"])
 app.include_router(knowledge.router, prefix="/api", tags=["知识库"])
+app.include_router(admin_knowledge.router, prefix="/api/admin/knowledge", tags=["管理员知识库"])
 app.include_router(resume.router, prefix="/api", tags=["简历"])
 app.include_router(skill.router, prefix="/api", tags=["Skill"])
 app.include_router(provider.router, prefix="/api", tags=["Provider"])
 app.include_router(interview.router, prefix="/api", tags=["文字面试"])
-app.include_router(aiops.router, prefix="/api", tags=["AIOps智能运维"])
-
-static_dir = "static"
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 @app.get("/")
-async def root():
-    """返回首页或基础信息。"""
+async def root() -> dict[str, str]:
+    """返回基础服务信息。"""
 
-    index_path = os.path.join(static_dir, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
     return {
         "message": f"Welcome to {config.app_name} API",
         "version": config.app_version,

@@ -86,6 +86,20 @@ class InterviewRepository:
         await self._session.flush()
         return entity
 
+    async def update_answer_metadata(
+        self,
+        answer_id: str,
+        metadata: dict,
+    ) -> InterviewAnswerEntity | None:
+        """更新答案元数据。"""
+
+        entity = await self._session.get(InterviewAnswerEntity, answer_id)
+        if entity is None:
+            return None
+        entity.answer_metadata_json = dict(metadata or {})
+        await self._session.flush()
+        return entity
+
     async def list_answers_by_session(
         self,
         session_id: str,

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from langchain_core.documents import Document
 import pytest
 
 from app.api import knowledge as knowledge_api
@@ -24,7 +26,7 @@ from app.models.knowledge import (
 from app.repositories.knowledge_repository import KnowledgeRepository
 from app.services.knowledge_service import KnowledgeService
 from app.services.rag_service import RagService
-from app.services.vector_index_service import KnowledgeIndexingResult
+from app.services.vector_index_service import KnowledgeIndexingResult, VectorIndexService
 from app.services.vector_store_manager import VectorSearchHit
 from app.utils.exceptions import BusinessException, ErrorCode
 
@@ -80,11 +82,22 @@ class _RecordingKnowledgeRepository:
     def __init__(self) -> None:
         self.added_knowledge_bases: list[KnowledgeBaseEntity] = []
         self.added_documents: list[KnowledgeDocumentEntity] = []
+        self.upserted_knowledge_bases: list[KnowledgeBaseEntity] = []
         self.document_update_snapshots: list[dict[str, Any]] = []
+        self.knowledge_bases_by_id: dict[str, KnowledgeBaseEntity] = {}
 
     async def add_knowledge_base(self, entity: KnowledgeBaseEntity) -> KnowledgeBaseEntity:
         self.added_knowledge_bases.append(entity)
+        self.knowledge_bases_by_id[entity.id] = entity
         return entity
+
+    async def upsert_knowledge_base(self, entity: KnowledgeBaseEntity) -> KnowledgeBaseEntity:
+        self.upserted_knowledge_bases.append(entity)
+        self.knowledge_bases_by_id[entity.id] = entity
+        return entity
+
+    async def get_knowledge_base(self, knowledge_base_id: str) -> KnowledgeBaseEntity | None:
+        return self.knowledge_bases_by_id.get(knowledge_base_id)
 
     async def add_document(self, entity: KnowledgeDocumentEntity) -> KnowledgeDocumentEntity:
         self.added_documents.append(entity)
@@ -227,7 +240,14 @@ async def test_knowledge_repository_handles_knowledge_documents() -> None:
 
     session = _FakeAsyncSession()
     repository = KnowledgeRepository(session)
-    knowledge_base = KnowledgeBaseEntity(id="kb-1", name="Python 参考知识")
+    knowledge_base = KnowledgeBaseEntity(
+        id="kb-1",
+        name="Python 参考知识",
+        category="reference_knowledge",
+        source_type="manual",
+        skill_id="python-backend",
+        is_enabled=True,
+    )
     document = KnowledgeDocumentEntity(
         id="doc-1",
         knowledge_base_id=knowledge_base.id,
@@ -238,6 +258,8 @@ async def test_knowledge_repository_handles_knowledge_documents() -> None:
         file_size=256,
         source_type="manual",
         category="reference_knowledge",
+        skill_id="python-backend",
+        is_enabled=True,
     )
 
     await repository.add_knowledge_base(knowledge_base)
@@ -250,6 +272,20 @@ async def test_knowledge_repository_handles_knowledge_documents() -> None:
     session.scalar_result = _FakeScalarResult([document])
     assert await repository.list_documents_by_knowledge_base(knowledge_base.id) == [document]
     assert await repository.list_documents_by_status(document.index_status) == [document]
+    assert await repository.list_enabled_documents_by_knowledge_base(knowledge_base.id) == [document]
+
+    session.scalar_result = _FakeScalarResult([knowledge_base])
+    assert await repository.list_enabled_knowledge_bases() == [knowledge_base]
+    assert (
+        await repository.find_knowledge_base_by_name_and_scope(
+            name=knowledge_base.name,
+            category=knowledge_base.category,
+            skill_id=knowledge_base.skill_id,
+            source_type=knowledge_base.source_type,
+            only_enabled=True,
+        )
+        is knowledge_base
+    )
 
 
 @pytest.mark.asyncio
@@ -282,16 +318,92 @@ async def test_knowledge_service_uploads_and_indexes_document() -> None:
     assert len(repository.added_documents) == 1
     assert repository.added_knowledge_bases[0].visitor_id == "00000000-0000-4000-8000-000000000011"
     assert storage_client.calls[0]["object_key"].startswith("knowledge/")
-    assert session.commit.await_count == 3
+    assert session.commit.await_count == 4
     assert repository.document_update_snapshots[0]["index_status"] == (
         KnowledgeDocumentIndexStatus.INDEXING.value
     )
     assert repository.document_update_snapshots[-1]["index_status"] == (
         KnowledgeDocumentIndexStatus.INDEXED.value
     )
+    assert repository.document_update_snapshots[-1]["metadata_json"]["doc_type"] == "domain_corpus"
     assert repository.document_update_snapshots[-1]["metadata_json"]["chunk_count"] == 4
+    assert repository.upserted_knowledge_bases[-1].metadata_json["document_count"] == 1
     assert result.index_status == KnowledgeDocumentIndexStatus.INDEXED.value
     assert result.chunk_count == 4
+
+
+@pytest.mark.asyncio
+async def test_knowledge_service_create_knowledge_base_only_persists_logical_record() -> None:
+    """创建知识库只写主记录，不上传文件、不触发索引。"""
+
+    session = AsyncMock()
+    repository = _RecordingKnowledgeRepository()
+    storage_client = _FakeStorageClient()
+    index_service = _SuccessfulIndexService(chunk_count=2)
+    service = KnowledgeService(
+        repository=repository,
+        storage_client=storage_client,
+        index_service=index_service,
+    )
+
+    knowledge_base = await service.create_knowledge_base(
+        session=session,
+        name="Python 核心知识库",
+        category="reference_knowledge",
+        source_type="manual",
+        description="用于 Python 后端技术问答",
+        skill_id="python-backend",
+        visitor_id="00000000-0000-4000-8000-000000000011",
+    )
+
+    assert knowledge_base.name == "Python 核心知识库"
+    assert knowledge_base.metadata_json["doc_type"] == "domain_corpus"
+    assert knowledge_base.metadata_json["document_count"] == 0
+    assert knowledge_base.is_enabled is True
+    assert len(repository.added_knowledge_bases) == 1
+    assert storage_client.calls == []
+    assert index_service.calls == []
+    assert session.commit.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_knowledge_service_add_document_to_existing_knowledge_base() -> None:
+    """可向已有知识库追加文档并回写文档计数。"""
+
+    session = AsyncMock()
+    repository = _RecordingKnowledgeRepository()
+    storage_client = _FakeStorageClient()
+    index_service = _SuccessfulIndexService(chunk_count=2)
+    service = KnowledgeService(
+        repository=repository,
+        storage_client=storage_client,
+        index_service=index_service,
+    )
+
+    knowledge_base = await service.create_knowledge_base(
+        session=session,
+        name="Java 项目知识库",
+        category="project_knowledge",
+        source_type="manual",
+        skill_id="java-backend",
+    )
+    session.commit.reset_mock()
+
+    result = await service.add_document_to_knowledge_base(
+        session=session,
+        knowledge_base_id=knowledge_base.id,
+        file_name="redis-case.md",
+        file_content=b"# Redis\ncache invalidation",
+        content_type="text/markdown",
+    )
+
+    assert len(repository.added_documents) == 1
+    assert result.knowledge_base_id == knowledge_base.id
+    assert result.name == "Java 项目知识库"
+    assert repository.upserted_knowledge_bases[-1].metadata_json["document_count"] == 1
+    assert repository.document_update_snapshots[-1]["metadata_json"]["doc_type"] == "domain_corpus"
+    assert repository.document_update_snapshots[-1]["metadata_json"]["chunk_count"] == 2
+    assert session.commit.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -459,3 +571,65 @@ def test_knowledge_upload_api_uses_request_visitor_context(
     assert visitor_id is not None
     assert upload_mock.await_args.kwargs["visitor_id"] == visitor_id
     assert "owner_id" not in upload_mock.await_args.kwargs
+
+
+def test_vector_index_service_writes_minimal_chunk_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """知识库索引应把最小必要字段写入分片 metadata。"""
+
+    document_path = tmp_path / "python.md"
+    document_path.write_text("# Python\ninterpreter", encoding="utf-8")
+    captured: dict[str, Any] = {}
+
+    def fake_split_document(content: str, file_path: str, metadata: dict[str, Any] | None = None):
+        captured["metadata"] = dict(metadata or {})
+        return [Document(page_content=content, metadata={"chunk_id": "doc-1:0"})]
+
+    class _FakeVectorStoreManager:
+        def __init__(self) -> None:
+            self.deleted_document_ids: list[str] = []
+            self.documents: list[Document] = []
+
+        def delete_by_document_id(self, document_id: str) -> int:
+            self.deleted_document_ids.append(document_id)
+            return 0
+
+        def add_documents(self, documents: list[Document]) -> list[str]:
+            self.documents.extend(documents)
+            return ["doc-1:0"]
+
+    fake_vector_store_manager = _FakeVectorStoreManager()
+    monkeypatch.setattr(
+        "app.services.vector_index_service.document_splitter_service.split_document",
+        fake_split_document,
+    )
+    monkeypatch.setattr(
+        "app.services.vector_index_service.vector_store_manager",
+        fake_vector_store_manager,
+    )
+
+    service = VectorIndexService()
+    document = KnowledgeDocumentEntity(
+        id="doc-1",
+        knowledge_base_id="kb-1",
+        original_file_name="python.md",
+        storage_path=str(document_path),
+        file_extension=".md",
+        mime_type="text/markdown",
+        file_size=32,
+        source_type="manual",
+        category="reference_knowledge",
+        skill_id="python-backend",
+        is_enabled=True,
+    )
+
+    result = service.index_knowledge_document(document)
+
+    assert result.success is True
+    assert captured["metadata"]["knowledge_base_id"] == "kb-1"
+    assert captured["metadata"]["document_id"] == "doc-1"
+    assert captured["metadata"]["skill_id"] == "python-backend"
+    assert captured["metadata"]["category"] == "reference_knowledge"
+    assert captured["metadata"]["is_enabled"] is True

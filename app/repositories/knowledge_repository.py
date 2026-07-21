@@ -83,6 +83,71 @@ class KnowledgeRepository:
         result = await self._session.scalars(stmt)
         return list(result.all())
 
+    async def find_knowledge_base_by_name_and_scope(
+        self,
+        *,
+        name: str,
+        category: str,
+        skill_id: str | None,
+        source_type: str | None = None,
+        only_enabled: bool = False,
+    ) -> KnowledgeBaseEntity | None:
+        """按名称、分类与主绑定 skill 查找单个知识库。"""
+
+        stmt = (
+            select(KnowledgeBaseEntity)
+            .where(KnowledgeBaseEntity.name == name)
+            .where(KnowledgeBaseEntity.category == category)
+        )
+        if skill_id is None:
+            stmt = stmt.where(KnowledgeBaseEntity.skill_id.is_(None))
+        else:
+            stmt = stmt.where(KnowledgeBaseEntity.skill_id == skill_id)
+        if source_type is not None:
+            stmt = stmt.where(KnowledgeBaseEntity.source_type == source_type)
+        if only_enabled:
+            stmt = stmt.where(KnowledgeBaseEntity.is_enabled.is_(True))
+
+        result = await self._session.scalars(stmt.limit(1))
+        return result.first()
+
+    async def list_enabled_knowledge_bases(
+        self,
+        *,
+        limit: int = 20,
+    ) -> list[KnowledgeBaseEntity]:
+        """查询已启用的知识库列表。"""
+
+        stmt = (
+            select(KnowledgeBaseEntity)
+            .where(KnowledgeBaseEntity.is_enabled.is_(True))
+            .order_by(desc(KnowledgeBaseEntity.updated_at))
+            .limit(limit)
+        )
+        result = await self._session.scalars(stmt)
+        return list(result.all())
+
+    async def list_knowledge_bases(
+        self,
+        *,
+        category: str | None = None,
+        skill_id: str | None = None,
+        enabled_only: bool = False,
+        limit: int = 50,
+    ) -> list[KnowledgeBaseEntity]:
+        """按可选范围查询知识库列表，供后台管理页使用。"""
+
+        stmt = select(KnowledgeBaseEntity)
+        if category:
+            stmt = stmt.where(KnowledgeBaseEntity.category == category)
+        if skill_id:
+            stmt = stmt.where(KnowledgeBaseEntity.skill_id == skill_id)
+        if enabled_only:
+            stmt = stmt.where(KnowledgeBaseEntity.is_enabled.is_(True))
+        stmt = stmt.order_by(desc(KnowledgeBaseEntity.updated_at)).limit(limit)
+        result = await self._session.scalars(stmt)
+        return list(result.all())
+
     async def add_document(self, entity: KnowledgeDocumentEntity) -> KnowledgeDocumentEntity:
         """新增知识库文件记录。"""
 
@@ -112,6 +177,26 @@ class KnowledgeRepository:
 
         stmt = select(KnowledgeDocumentEntity).where(
             KnowledgeDocumentEntity.knowledge_base_id == knowledge_base_id,
+        )
+        if index_status is not None:
+            stmt = stmt.where(KnowledgeDocumentEntity.index_status == _status_value(index_status))
+        stmt = stmt.order_by(desc(KnowledgeDocumentEntity.updated_at)).limit(limit)
+        result = await self._session.scalars(stmt)
+        return list(result.all())
+
+    async def list_enabled_documents_by_knowledge_base(
+        self,
+        knowledge_base_id: str,
+        *,
+        index_status: KnowledgeDocumentIndexStatus | str | None = None,
+        limit: int = 50,
+    ) -> list[KnowledgeDocumentEntity]:
+        """查询某个知识库下已启用的文件记录。"""
+
+        stmt = (
+            select(KnowledgeDocumentEntity)
+            .where(KnowledgeDocumentEntity.knowledge_base_id == knowledge_base_id)
+            .where(KnowledgeDocumentEntity.is_enabled.is_(True))
         )
         if index_status is not None:
             stmt = stmt.where(KnowledgeDocumentEntity.index_status == _status_value(index_status))
@@ -210,6 +295,18 @@ class KnowledgeRepository:
         entity = await self.get_chat_session(session_id)
         if entity is None:
             return
+        await self._session.delete(entity)
+        await self._session.flush()
+
+    async def delete_knowledge_base(self, entity: KnowledgeBaseEntity) -> None:
+        """物理删除知识库记录。"""
+
+        await self._session.delete(entity)
+        await self._session.flush()
+
+    async def delete_document(self, entity: KnowledgeDocumentEntity) -> None:
+        """物理删除知识库文档记录。"""
+
         await self._session.delete(entity)
         await self._session.flush()
 

@@ -1,0 +1,141 @@
+.timelineCard {
+  display: grid;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  border: 1px solid rgba(192, 75, 34, 0.16);
+  border-radius: var(--radius-2xl);
+  background:
+    radial-gradient(circle at 8% 0%, rgba(192, 75, 34, 0.12), transparent 34%),
+    linear-gradient(145deg, rgba(255, 248, 238, 0.92), rgba(255, 255, 255, 0.86));
+  box-shadow: var(--shadow-sm);
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-4);
+  align-items: flex-start;
+}
+
+.header h3 {
+  margin: 0;
+  font-size: var(--font-size-18);
+}
+
+.header p {
+  margin: var(--space-2) 0 0;
+  color: var(--color-text-secondary);
+  line-height: 1.7;
+}
+
+.elapsed {
+  flex: 0 0 auto;
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
+  background: rgba(13, 18, 33, 0.06);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-12);
+  font-weight: var(--font-weight-semibold);
+}
+
+.stepList {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.stepItem {
+  position: relative;
+  display: grid;
+  grid-template-columns: 2rem minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: flex-start;
+}
+
+.marker {
+  display: inline-flex;
+  width: 2rem;
+  height: 2rem;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: rgba(68, 81, 103, 0.1);
+  color: var(--color-text-tertiary);
+  font-size: 0.68rem;
+  font-weight: var(--font-weight-bold);
+}
+
+.stepBody {
+  display: grid;
+  gap: 0.18rem;
+  padding-top: 0.12rem;
+}
+
+.stepBody strong {
+  color: var(--color-text-primary);
+  font-size: var(--font-size-15);
+}
+
+.stepBody span {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-13);
+  line-height: 1.55;
+}
+
+.status_completed .marker {
+  background: rgba(31, 143, 95, 0.14);
+  color: var(--color-success);
+}
+
+.status_active .marker {
+  background: var(--color-brand-strong);
+  color: white;
+  animation: pulse 1.35s ease-in-out infinite;
+}
+
+.status_active .stepBody strong {
+  color: var(--color-brand-strong);
+}
+
+.status_failed .marker {
+  background: rgba(186, 58, 51, 0.14);
+  color: rgb(186, 58, 51);
+}
+
+.status_failed .stepBody strong {
+  color: rgb(186, 58, 51);
+}
+
+.status_pending {
+  opacity: 0.62;
+}
+
+.footer {
+  padding-top: var(--space-2);
+  border-top: 1px solid rgba(68, 81, 103, 0.1);
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(192, 75, 34, 0.24);
+    transform: scale(1);
+  }
+
+  50% {
+    box-shadow: 0 0 0 0.45rem rgba(192, 75, 34, 0);
+    transform: scale(1.04);
+  }
+}
+
+@media (max-width: 640px) {
+  .header {
+    display: grid;
+  }
+
+  .elapsed {
+    width: fit-content;
+  }
+}

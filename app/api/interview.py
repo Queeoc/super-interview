@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
+from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
@@ -145,6 +146,12 @@ async def submit_interview_answer(
                 ),
             }
         except Exception as exc:
+            logger.exception(
+                "submit interview answer stream failed session_id={}, visitor_id={}, question_key={}",
+                session_id,
+                visitor_id,
+                request.question_key,
+            )
             yield {
                 "event": "message",
                 "data": json.dumps(

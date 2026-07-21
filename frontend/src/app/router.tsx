@@ -3,6 +3,7 @@ import { createBrowserRouter } from 'react-router-dom';
 import { AppShell } from './AppShell';
 import { HomePage } from '../pages/HomePage';
 import { InterviewPage } from '../pages/InterviewPage';
+import { InterviewReportPage } from '../pages/InterviewReportPage';
 import { InterviewSessionPage } from '../pages/InterviewSessionPage';
 import { ResumePage } from '../pages/ResumePage';
 import { KnowledgePage } from '../pages/KnowledgePage';
@@ -24,6 +25,10 @@ export const appRouter = createBrowserRouter([
       {
         path: 'interview/:sessionId',
         element: <InterviewSessionPage />
+      },
+      {
+        path: 'interview/:sessionId/report',
+        element: <InterviewReportPage />
       },
       {
         path: 'resume',

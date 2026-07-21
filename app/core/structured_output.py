@@ -313,9 +313,11 @@ class StructuredOutputRunner:
             value_annotation = value_args[1] if len(value_args) >= 2 else Any
             if field_name == "dimension_scores":
                 return {
+                    "project_experience": 0.0,
                     "technical_depth": 0.0,
-                    "implementation_clarity": 0.0,
-                    "problem_solving": 0.0,
+                    "skill_match": 0.0,
+                    "content_completeness": 0.0,
+                    "communication_clarity": 0.0,
                 }
             return {"key": self._example_for_annotation(value_annotation, field_name=field_name)}
 

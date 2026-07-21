@@ -235,9 +235,9 @@ class VectorIndexService:
                 metadata={
                     "knowledge_base_id": document.knowledge_base_id,
                     "document_id": document.id,
-                    "source_type": document.source_type,
-                    "category": document.category,
                     "skill_id": document.skill_id,
+                    "category": document.category,
+                    "is_enabled": bool(document.is_enabled),
                     "_source": normalized_path,
                     "_file_name": document.original_file_name,
                     "_extension": document.file_extension,

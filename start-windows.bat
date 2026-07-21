@@ -9,11 +9,11 @@ echo.
 
 set CONDA_ENV_NAME=biz_agent
 
-echo [1/5] 检查 Conda 环境...
+echo [1/5] 检�?Conda 环境...
 
 where conda >nul 2>&1
 if not errorlevel 1 (
-    echo [成功] 在 PATH 中找到 conda
+    echo [成功] �?PATH 中找�?conda
     goto :conda_ready
 )
 
@@ -33,7 +33,7 @@ if exist "C:\ProgramData\miniconda3\Scripts\conda.exe" (
     goto :conda_ready
 )
 
-echo [错误] 未找到 Conda，请先安装 Miniconda
+echo [错误] 未找�?Conda，请先安�?Miniconda
 echo [提示] https://docs.anaconda.com/miniconda/install/
 pause
 exit /b 1
@@ -54,11 +54,11 @@ echo [信息] Python: %PYTHON_CMD%
 %PYTHON_CMD% --version
 echo.
 
-echo [3/5] 启动 Milvus 向量数据库...
+echo [3/5] 启动 Milvus 向量数据�?..
 
 where docker >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 未找到 Docker，请先安装 Docker Desktop
+    echo [错误] 未找�?Docker，请先安�?Docker Desktop
     pause
     exit /b 1
 )
@@ -69,43 +69,43 @@ if not errorlevel 1 (
 ) else (
     docker compose -f vector-database.yml up -d
     if errorlevel 1 (
-        echo [错误] Docker 启动失败，请确认 Docker Desktop 已启动
+        echo [错误] Docker 启动失败，请确认 Docker Desktop 已启�?
         pause
         exit /b 1
     )
-    echo [信息] 等待 Milvus 启动 (10秒)...
+    echo [信息] 等待 Milvus 启动 (10�?...
     timeout /t 10 /nobreak >nul
 )
-echo [成功] Milvus 数据库就绪
+echo [成功] Milvus 数据库就�?
 echo.
 
 echo [4/5] 启动 CLS MCP 服务...
 start "CLS MCP Server" /min %PYTHON_CMD% mcp_servers/cls_server.py
 timeout /t 2 /nobreak >nul
-echo [成功] CLS MCP 服务已启动
+echo [成功] CLS MCP 服务已启�?
 echo.
 
 echo [5/5] 启动 Monitor MCP 服务...
 start "Monitor MCP Server" /min %PYTHON_CMD% mcp_servers/monitor_server.py
 timeout /t 2 /nobreak >nul
-echo [成功] Monitor MCP 服务已启动
+echo [成功] Monitor MCP 服务已启�?
 echo.
 
 echo [启动] 启动 FastAPI 服务...
 start "super-interview API" %PYTHON_CMD% -m uvicorn app.main:app --host 0.0.0.0 --port 9900
-echo [信息] 等待服务启动 (15秒)...
+echo [信息] 等待服务启动 (15�?...
 timeout /t 15 /nobreak >nul
 echo.
 
-echo [信息] 检查服务状态...
+echo [信息] 检查服务状�?..
 curl -s http://localhost:9900/health >nul 2>&1
 if errorlevel 1 (
-    echo [警告] 服务可能尚未就绪，跳过文档上传
+    echo [警告] 服务可能尚未就绪，跳过文档上�?
 ) else (
     echo [成功] FastAPI 服务运行正常
     echo.
     echo [上传] 上传文档到向量数据库...
-    for %%f in (aiops-docs\*.md) do (
+    for %%f in (knowledge_base\rubrics\*.md) do (
         echo   上传: %%~nxf
         curl -s -X POST http://localhost:9900/api/upload -F "file=@%%f" >nul 2>&1
     )
@@ -114,7 +114,7 @@ if errorlevel 1 (
 
 echo.
 echo ====================================
-echo   服务启动完成！
+echo   服务启动完成�?
 echo ====================================
 echo.
 echo  Web:      http://localhost:9900

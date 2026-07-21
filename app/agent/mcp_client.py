@@ -4,7 +4,7 @@ MCP 客户端管理
 """
 
 import asyncio
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 from mcp.types import CallToolResult, TextContent
@@ -82,7 +82,7 @@ DEFAULT_MCP_SERVERS = config.mcp_servers
 
 
 async def get_mcp_client(
-    servers: Optional[Dict[str, Dict[str, str]]] = None,
+    servers: Optional[Dict[str, Dict[str, Any]]] = None,
     tool_interceptors: Optional[List] = None,
     force_new: bool = False
 ) -> MultiServerMCPClient:
@@ -128,7 +128,7 @@ async def get_mcp_client(
 
 
 async def get_mcp_client_with_retry(
-    servers: Optional[Dict[str, Dict[str, str]]] = None,
+    servers: Optional[Dict[str, Dict[str, Any]]] = None,
     tool_interceptors: Optional[List] = None,
     force_new: bool = False
 ) -> MultiServerMCPClient:
@@ -159,7 +159,7 @@ async def get_mcp_client_with_retry(
 
 
 def _create_mcp_client(
-    servers: Dict[str, Dict[str, str]],
+    servers: Dict[str, Dict[str, Any]],
     tool_interceptors: Optional[List] = None
 ) -> MultiServerMCPClient:
     """
@@ -172,8 +172,8 @@ def _create_mcp_client(
     Returns:
         MultiServerMCPClient: 未初始化的客户端实例
     """
-    # MultiServerMCPClient 的第一个参数直接接收 servers 配置字典
-    # 格式: {server_name: {"transport": "...", "url": "..."}}
+    # MultiServerMCPClient 的第一个参数直接接收 servers 配置字典。
+    # 这里保持原样透传，兼容 streamable-http 与 stdio 两类 MCP 服务描述。
     kwargs: Dict[str, Any] = {}
     
     if tool_interceptors:

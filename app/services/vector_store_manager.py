@@ -137,6 +137,17 @@ class VectorStoreManager:
         expr = f'metadata["document_id"] == "{escaped_document_id}"'
         return self._delete_by_expr(expr, context_value=document_id, context_label="document_id")
 
+    def delete_by_knowledge_base_id(self, knowledge_base_id: str) -> int:
+        """删除某个知识库下的所有向量分片。"""
+
+        escaped_knowledge_base_id = self._escape_expr_value(knowledge_base_id)
+        expr = f'metadata["knowledge_base_id"] == "{escaped_knowledge_base_id}"'
+        return self._delete_by_expr(
+            expr,
+            context_value=knowledge_base_id,
+            context_label="knowledge_base_id",
+        )
+
     def delete_by_source(self, file_path: str) -> int:
         """
         删除指定文件的所有文档
@@ -188,6 +199,8 @@ class VectorStoreManager:
         top_k: int = 3,
         score_threshold: float | None = None,
         knowledge_base_ids: list[str] | None = None,
+        skill_id: str | None = None,
+        include_global_skill: bool = True,
         category: str | None = None,
     ) -> list[VectorSearchHit]:
         """
@@ -208,49 +221,24 @@ class VectorStoreManager:
             self._ensure_initialized()
             collection = milvus_manager.get_collection()
             query_vector = vector_embedding_service.embed_query(query)
-            expr = self._build_metadata_filter_expression(
+            hits = self._search_documents_with_collection(
+                collection=collection,
+                query_vector=query_vector,
+                top_k=top_k,
+                score_threshold=score_threshold,
                 knowledge_base_ids=knowledge_base_ids,
-                category=category,
+                skill_id=skill_id,
+                include_global_skill=include_global_skill,
             )
 
-            search_kwargs: dict[str, Any] = {
-                "data": [query_vector],
-                "anns_field": "vector",
-                "param": {
-                    "metric_type": "L2",
-                    "params": {"nprobe": 10},
-                },
-                "limit": top_k,
-                "output_fields": ["id", "content", "metadata"],
-            }
-            if expr is not None:
-                search_kwargs["expr"] = expr
-
-            results = collection.search(**search_kwargs)
-
-            hits: list[VectorSearchHit] = []
-            for search_hits in results:
-                for hit in search_hits:
-                    score = float(hit.distance)
-                    if score_threshold is not None and score > score_threshold:
-                        continue
-
-                    metadata = hit.entity.get("metadata", {}) or {}
-                    hits.append(
-                        VectorSearchHit(
-                            id=str(hit.entity.get("id")),
-                            content=str(hit.entity.get("content") or ""),
-                            score=score,
-                            metadata=dict(metadata),
-                        )
-                    )
-
             logger.info(
-                "知识检索完成: query={}, top_k={}, score_threshold={}, knowledge_base_ids={}, category={}, result_count={}",
+                "知识检索完成: query={}, top_k={}, score_threshold={}, knowledge_base_ids={}, skill_id={}, include_global_skill={}, category={}, result_count={}",
                 query,
                 top_k,
                 score_threshold,
                 knowledge_base_ids or [],
+                skill_id,
+                include_global_skill,
                 category,
                 len(hits),
             )
@@ -259,15 +247,87 @@ class VectorStoreManager:
             logger.error("知识检索失败: query={}, error={}", query, exc)
             raise
 
+    def _search_documents_with_collection(
+        self,
+        *,
+        collection: Any,
+        query_vector: list[float],
+        top_k: int,
+        score_threshold: float | None,
+        knowledge_base_ids: list[str] | None,
+        skill_id: str | None,
+        include_global_skill: bool,
+    ) -> list[VectorSearchHit]:
+        """执行一次或两次检索并合并结果。"""
+
+        search_kwargs: dict[str, Any] = {
+            "data": [query_vector],
+            "anns_field": "vector",
+            "param": {"metric_type": "L2", "params": {"nprobe": 10}},
+            "limit": top_k,
+            "output_fields": ["id", "content", "metadata"],
+        }
+
+        exprs: list[str | None] = []
+        if skill_id and include_global_skill:
+            exprs.append(
+                self._build_metadata_filter_expression(
+                    knowledge_base_ids=knowledge_base_ids,
+                    skill_id=skill_id,
+                    include_global_skill=False,
+                )
+            )
+            exprs.append(
+                self._build_metadata_filter_expression(
+                    knowledge_base_ids=knowledge_base_ids,
+                    skill_id=None,
+                    include_global_skill=False,
+                )
+            )
+        else:
+            exprs.append(
+                self._build_metadata_filter_expression(
+                    knowledge_base_ids=knowledge_base_ids,
+                    skill_id=skill_id,
+                    include_global_skill=False,
+                )
+            )
+
+        hits_by_id: dict[str, VectorSearchHit] = {}
+        for expr in exprs:
+            run_kwargs = dict(search_kwargs)
+            if expr is not None:
+                run_kwargs["expr"] = expr
+            results = collection.search(**run_kwargs)
+            for search_hits in results:
+                for hit in search_hits:
+                    score = float(hit.distance)
+                    if score_threshold is not None and score > score_threshold:
+                        continue
+                    metadata = hit.entity.get("metadata", {}) or {}
+                    hit_item = VectorSearchHit(
+                        id=str(hit.entity.get("id")),
+                        content=str(hit.entity.get("content") or ""),
+                        score=score,
+                        metadata=dict(metadata),
+                    )
+                    existing = hits_by_id.get(hit_item.id)
+                    if existing is None or hit_item.score < existing.score:
+                        hits_by_id[hit_item.id] = hit_item
+
+        hits = sorted(hits_by_id.values(), key=lambda item: item.score)
+        return hits[:top_k]
+
     def _build_metadata_filter_expression(
         self,
         *,
         knowledge_base_ids: list[str] | None,
-        category: str | None,
+        skill_id: str | None,
+        include_global_skill: bool,
     ) -> str | None:
         """构建 Milvus JSON 元数据过滤表达式。"""
 
-        expressions: list[str] = []
+        expressions: list[str] = ['metadata["is_enabled"] == true']
 
         if knowledge_base_ids:
             kb_expressions = [
@@ -276,13 +336,8 @@ class VectorStoreManager:
             ]
             expressions.append(f"({' or '.join(kb_expressions)})")
 
-        if category:
-            expressions.append(
-                f'metadata["category"] == "{self._escape_expr_value(category)}"'
-            )
-
-        if not expressions:
-            return None
+        if skill_id and not include_global_skill:
+            expressions.append(f'metadata["skill_id"] == "{self._escape_expr_value(skill_id)}"')
 
         return " and ".join(expressions)
 

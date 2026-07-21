@@ -14,6 +14,7 @@ from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.interview.executor import InterviewExecutor
+from app.agent.interview.plan_observer import InterviewPlanObserver
 from app.agent.interview.planner import InterviewPlanner
 from app.agent.interview.prompts import InterviewPromptRunner
 from app.agent.interview.replanner import InterviewReplanner
@@ -24,8 +25,11 @@ from app.agent.interview.state import (
     build_session_context_payload,
     clone_state,
     get_current_question,
+    get_latest_observation,
+    hydrate_plan_state,
     list_questions,
     mark_question_answered,
+    resolve_main_question_key,
 )
 from app.config import config
 from app.core.stream_producer import StreamProducer, StreamTaskEnvelope, stream_producer
@@ -140,6 +144,7 @@ class InterviewService:
         repository_factory: Callable[[AsyncSession], InterviewRepository] | None = None,
         prompt_runner: InterviewPromptRunner | None = None,
         planner: InterviewPlanner | None = None,
+        plan_observer: InterviewPlanObserver | None = None,
         executor: InterviewExecutor | None = None,
         replanner: InterviewReplanner | None = None,
         cache: InterviewSessionCache | None = None,
@@ -154,6 +159,7 @@ class InterviewService:
             enable_llm=bool(config.dashscope_api_key),
         )
         self._planner = planner or InterviewPlanner(self._prompt_runner)
+        self._plan_observer = plan_observer or InterviewPlanObserver(self._prompt_runner)
         self._executor = executor or InterviewExecutor(self._prompt_runner)
         self._replanner = replanner or InterviewReplanner(self._prompt_runner)
         self._cache = cache or InterviewSessionCache()
@@ -216,6 +222,13 @@ class InterviewService:
         )
         language = request.language or config.interview.default_language
         title = request.title or f"{skill_detail.display_name} 模拟面试"
+        planning_snapshot_markdown, planning_snapshot_sources = self._build_planning_snapshot(
+            skill_detail,
+            reference_section.reference_markdown,
+            reference_section.resolved_reference_files,
+            resume_markdown=resume_context.markdown_content if resume_context else "",
+            resume_metadata=resume_context.metadata if resume_context else {},
+        )
 
         initial_state = build_initial_state(
             session_id=session_id,
@@ -223,6 +236,8 @@ class InterviewService:
                 skill_detail,
                 reference_section.reference_markdown,
                 reference_section.resolved_reference_files,
+                planning_snapshot_markdown=planning_snapshot_markdown,
+                planning_snapshot_sources=planning_snapshot_sources,
                 resume_markdown=resume_context.markdown_content if resume_context else "",
                 resume_metadata=resume_context.metadata if resume_context else {},
             ),
@@ -253,6 +268,8 @@ class InterviewService:
                 skill_detail,
                 reference_section.reference_markdown,
                 reference_section.resolved_reference_files,
+                planning_snapshot_markdown=planning_snapshot_markdown,
+                planning_snapshot_sources=planning_snapshot_sources,
                 resume_markdown=resume_context.markdown_content if resume_context else "",
                 resume_metadata=resume_context.metadata if resume_context else {},
             ),
@@ -381,14 +398,40 @@ class InterviewService:
         )
         self._ensure_session_is_active(interview_session)
         current_question = self._require_current_question(state, request.question_key)
+        answer_text = request.answer_text.strip()
+        logger.info(
+            "submit_answer_stream started session_id={}, visitor_id={}, question_key={}, round_index={}, answer_length={}",
+            session_id,
+            visitor_id,
+            current_question["question_key"],
+            current_question["round_index"],
+            len(answer_text),
+        )
 
-        yield {
+        process_run = self._build_initial_process_run(
+            question_key=current_question["question_key"],
+            round_index=int(current_question["round_index"]),
+            process_run_id=(
+                str(request.answer_metadata.get("process_run_id")).strip()
+                if request.answer_metadata.get("process_run_id")
+                else None
+            ),
+        )
+
+        def record_process_event(event: dict[str, Any]) -> dict[str, Any]:
+            self._append_process_event(process_run, event)
+            return event
+
+        yield record_process_event({
             "type": "status",
             "message": "已加载当前面试会话",
             "session_id": session_id,
-        }
+            "stage": "session_loaded",
+            "label": "加载会话与答案上下文",
+            "detail": "已加载当前面试会话，准备分析本轮回答。",
+        })
 
-        state["latest_answer_text"] = request.answer_text.strip()
+        state["latest_answer_text"] = answer_text
         state["latest_answer_metadata"] = deepcopy(request.answer_metadata)
         state["last_draft_answer"] = {}
         state["feedback"] = self._build_pending_feedback()
@@ -398,20 +441,136 @@ class InterviewService:
         state["answer_count"] = len(answers) + 1
         mark_question_answered(state, current_question["question_key"])
 
-        transitioned_state = await self._advance_graph.ainvoke(state)
-        yield {
-            "type": "plan",
-            "action": transitioned_state.get("next_action"),
-            "reason": transitioned_state.get("action_reason"),
-            "session_id": session_id,
-        }
+        logger.info(
+            "submit_answer_stream stage=answer_observation status=start session_id={}, question_key={}, round_index={}",
+            session_id,
+            current_question["question_key"],
+            current_question["round_index"],
+        )
+        yield record_process_event(self._build_stream_status_event(
+            session_id=session_id,
+            stage="answer_observation_start",
+            label="评估回答完整性",
+            detail="正在判断当前回答是否覆盖本题关键观察点。",
+            message="开始评估回答完整性",
+        ))
+        observed_state = await self._plan_observer.run(state)
+        latest_observation = get_latest_observation(
+            observed_state,
+            question_key=current_question["question_key"],
+            main_question_key=resolve_main_question_key(observed_state, question=current_question)
+            or current_question["question_key"],
+        ) or {}
+        yield record_process_event(self._build_stream_status_event(
+            session_id=session_id,
+            stage="answer_observation_complete",
+            label="评估回答完整性",
+            detail=self._build_observation_stage_detail(latest_observation),
+            message="回答完整性评估完成",
+        ))
 
+        logger.info(
+            "submit_answer_stream stage=replan status=start session_id={}, question_key={}",
+            session_id,
+            current_question["question_key"],
+        )
+        yield record_process_event(self._build_stream_status_event(
+            session_id=session_id,
+            stage="replan_start",
+            label="判断下一步动作",
+            detail="正在判断需要追问、切换主题还是结束面试。",
+            message="开始判断下一步动作",
+        ))
+        replanned_state = await self._replanner.run(observed_state)
+        yield record_process_event(self._build_stream_status_event(
+            session_id=session_id,
+            stage="replan_complete",
+            label="判断下一步动作",
+            detail=f"下一步动作：{replanned_state.get('next_action', 'unknown')}。",
+            message="下一步动作判断完成",
+        ))
+        yield record_process_event({
+            "type": "plan",
+            "action": replanned_state.get("next_action"),
+            "reason": replanned_state.get("action_reason"),
+            "session_id": session_id,
+        })
+
+        is_follow_up_action = replanned_state.get("next_action") == InterviewWorkflowAction.FOLLOW_UP.value
+        if not replanned_state.get("completed"):
+            if is_follow_up_action:
+                yield record_process_event(self._build_stream_status_event(
+                    session_id=session_id,
+                    stage="tool_prepare_start",
+                    label="准备工具上下文",
+                    detail="正在判断是否需要结合简历或 GitHub 代码证据继续追问。",
+                    message="开始准备工具上下文",
+                ))
+            else:
+                yield record_process_event(self._build_stream_status_event(
+                    session_id=session_id,
+                    stage="llm_generation_start",
+                    label="LLM 生成下一题 / 结束语",
+                    detail="正在生成面试官下一条提问或收尾说明。",
+                    message="开始生成面试官回应",
+                ))
+        elif replanned_state.get("next_action") == InterviewWorkflowAction.COMPLETE.value:
+            yield record_process_event(self._build_stream_status_event(
+                session_id=session_id,
+                stage="llm_generation_start",
+                label="LLM 生成下一题 / 结束语",
+                detail="正在生成本场面试的收尾说明。",
+                message="开始生成面试收尾说明",
+            ))
+
+        transitioned_state = await self._executor.run(replanned_state)
+        if is_follow_up_action:
+            tool_context = dict(transitioned_state.get("latest_tool_context", {}) or {})
+            if tool_context.get("success") and tool_context.get("tool_name"):
+                yield record_process_event(self._build_stream_status_event(
+                    session_id=session_id,
+                    stage="tool_call_complete",
+                    label="调用证据工具",
+                    detail=self._build_tool_stage_detail(tool_context),
+                    message="证据工具调用完成",
+                    extra={"tool": self._build_tool_status_summary(tool_context)},
+                ))
+            else:
+                yield record_process_event(self._build_stream_status_event(
+                    session_id=session_id,
+                    stage="tool_skipped",
+                    label="准备工具上下文",
+                    detail=self._build_tool_stage_detail(tool_context) or "本轮未调用证据工具。",
+                    message="本轮未调用证据工具",
+                ))
+            yield record_process_event(self._build_stream_status_event(
+                session_id=session_id,
+                stage="llm_generation_start",
+                label="LLM 生成下一题 / 结束语",
+                detail="已结合工具结果生成面试官下一条追问。",
+                message="开始生成面试官回应",
+            ))
+        yield record_process_event(self._build_stream_status_event(
+            session_id=session_id,
+            stage="llm_generation_complete",
+            label="LLM 生成下一题 / 结束语",
+            detail="面试官回应已生成。",
+            message="面试官回应生成完成",
+        ))
+        logger.info(
+            "submit_answer_stream stage=graph status=complete session_id={}, question_key={}, next_action={}, completed={}, assistant_message_present={}",
+            session_id,
+            current_question["question_key"],
+            transitioned_state.get("next_action"),
+            bool(transitioned_state.get("completed", False)),
+            bool(transitioned_state.get("assistant_message")),
+        )
         answer_entity = InterviewAnswerEntity(
             session_id=session_id,
             round_index=current_question["round_index"],
             question_key=current_question["question_key"],
             question_text=current_question["question_text"],
-            answer_text=request.answer_text.strip(),
+            answer_text=answer_text,
             answer_status=InterviewAnswerStatus.SUBMITTED.value,
             score_json={
                 "status": "pending",
@@ -422,6 +581,7 @@ class InterviewService:
                 **deepcopy(request.answer_metadata),
                 "question_source": current_question.get("source"),
                 "is_follow_up": bool(current_question.get("is_follow_up")),
+                "process_run": deepcopy(process_run),
             },
         )
 
@@ -432,6 +592,20 @@ class InterviewService:
             existing_report=report,
         )
 
+        logger.info(
+            "submit_answer_stream stage=persist status=start session_id={}, question_key={}, completed={}",
+            session_id,
+            current_question["question_key"],
+            bool(transitioned_state.get("completed", False)),
+        )
+        yield record_process_event(self._build_stream_status_event(
+            session_id=session_id,
+            stage="persist_start",
+            label="保存本轮结果",
+            detail="正在保存答案、题目状态和流程结果。",
+            message="开始保存本轮结果",
+        ))
+        answer_entity.answer_metadata_json["process_run"] = deepcopy(process_run)
         await self._persistence_service.save_answer_and_session_snapshot(
             session,
             interview_session=interview_session,
@@ -449,20 +623,42 @@ class InterviewService:
             await self._cache.delete_state(session_id)
         else:
             await self._cache.set_state(session_id, transitioned_state)
+        logger.info(
+            "submit_answer_stream stage=persist status=complete session_id={}, question_key={}, cache_action={}, report_pending={}",
+            session_id,
+            current_question["question_key"],
+            "delete" if transitioned_state.get("completed") else "set",
+            bool(report_entity),
+        )
+        yield record_process_event(self._build_stream_status_event(
+            session_id=session_id,
+            stage="persist_complete",
+            label="保存本轮结果",
+            detail="本轮答案和面试状态已保存。",
+            message="本轮结果保存完成",
+        ))
 
         if transitioned_state.get("assistant_message"):
-            yield {
+            yield record_process_event({
                 "type": "content",
                 "session_id": session_id,
                 "content": transitioned_state["assistant_message"],
-            }
+            })
 
         if transitioned_state.get("completed"):
-            yield {
+            logger.info(
+                "submit_answer_stream stage=report status=start session_id={}, question_key={}",
+                session_id,
+                current_question["question_key"],
+            )
+            yield record_process_event({
                 "type": "status",
                 "session_id": session_id,
                 "message": "面试已结束，开始生成统一评估报告",
-            }
+                "stage": "report_start",
+                "label": "生成统一评估报告",
+                "detail": "正在收集本场问答并生成统一评估报告。",
+            })
             report_entity = await self._schedule_or_generate_report(
                 session,
                 session_id=session_id,
@@ -470,12 +666,30 @@ class InterviewService:
                 state=transitioned_state,
                 existing_report=report_entity or report,
             )
-            yield {
+            logger.info(
+                "submit_answer_stream stage=report status=complete session_id={}, question_key={}, report_status={}",
+                session_id,
+                current_question["question_key"],
+                report_entity.status,
+            )
+            yield record_process_event(self._build_stream_status_event(
+                session_id=session_id,
+                stage="report_complete",
+                label="生成统一评估报告",
+                detail=f"统一评估报告状态：{report_entity.status}。",
+                message="统一评估报告已更新",
+            ))
+            yield record_process_event({
                 "type": "report",
                 "session_id": session_id,
                 "report": deepcopy(report_entity.report_json),
-            }
+            })
 
+        logger.info(
+            "submit_answer_stream stage=dto status=start session_id={}, question_key={}",
+            session_id,
+            current_question["question_key"],
+        )
         step_response = SubmitAnswerResponse(
             session_id=session_id,
             action=transitioned_state.get("next_action", InterviewWorkflowAction.NEXT_QUESTION.value),
@@ -487,17 +701,52 @@ class InterviewService:
             feedback=deepcopy(transitioned_state.get("feedback", {})),
             report_status=report_entity.status if report_entity else (report.status if report else None),
         )
-        yield {
+        yield record_process_event({
             "type": "step_complete",
             "session_id": session_id,
             "response": step_response.model_dump(mode="json"),
-        }
+        })
 
+        process_run["status"] = "completed"
+        self._append_process_event(
+            process_run,
+            {
+                "type": "done",
+                "session_id": session_id,
+            },
+        )
+        answer_entity.answer_metadata_json = {
+            **deepcopy(answer_entity.answer_metadata_json or {}),
+            "process_run": deepcopy(process_run),
+        }
+        await self._persistence_service.update_answer_metadata(
+            session,
+            answer_id=answer_entity.id,
+            metadata=answer_entity.answer_metadata_json,
+        )
+        await self._commit_or_raise(
+            session,
+            code=ErrorCode.INTERVIEW_PERSIST_FAILED,
+            message="更新运行过程记录失败",
+            details={"session_id": session_id, "answer_id": answer_entity.id},
+        )
         final_dto = self._build_session_dto(
             interview_session,
             transitioned_state,
             answers=answers + [answer_entity],
             report=report_entity or report,
+        )
+        logger.info(
+            "submit_answer_stream stage=dto status=complete session_id={}, question_key={}, session_status={}, completed={}",
+            session_id,
+            current_question["question_key"],
+            final_dto.status,
+            final_dto.completed,
+        )
+        logger.info(
+            "submit_answer_stream stage=done status=emit session_id={}, question_key={}",
+            session_id,
+            current_question["question_key"],
         )
         yield {
             "type": "done",
@@ -588,9 +837,11 @@ class InterviewService:
         """构建答题推进图：replanner -> executor/END。"""
 
         workflow = StateGraph(InterviewState)
+        workflow.add_node("plan_observer", self._plan_observer.run)
         workflow.add_node("replanner", self._replanner.run)
         workflow.add_node("executor", self._executor.run)
-        workflow.set_entry_point("replanner")
+        workflow.set_entry_point("plan_observer")
+        workflow.add_edge("plan_observer", "replanner")
 
         def route_after_replanner(state: InterviewState) -> str:
             if state.get("completed"):
@@ -612,6 +863,321 @@ class InterviewService:
         """解析当前请求要使用的仓储。"""
 
         return self._repository_factory(session)
+
+    @staticmethod
+    def _build_stream_status_event(
+        *,
+        session_id: str,
+        stage: str,
+        label: str,
+        detail: str,
+        message: str,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """构建兼容旧客户端的 SSE 状态事件。"""
+
+        event = {
+            "type": "status",
+            "session_id": session_id,
+            "stage": stage,
+            "label": label,
+            "detail": detail,
+            "message": message,
+        }
+        if extra:
+            event.update(extra)
+        return event
+
+    @staticmethod
+    def _build_initial_process_run(
+        *,
+        question_key: str | None,
+        round_index: int,
+        process_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """构建用于刷新后回放的本轮运行过程。"""
+
+        return {
+            "id": process_run_id or f"{question_key or 'round'}-{round_index}-{uuid4()}",
+            "question_key": question_key,
+            "round_index": round_index,
+            "status": "running",
+            "steps": [
+                {
+                    "id": "submit",
+                    "label": "提交答案",
+                    "detail": "答案已发送到服务端，正在进入本轮处理流程。",
+                    "status": "completed",
+                    "timestamp": InterviewService._process_timestamp_ms(),
+                }
+            ],
+        }
+
+    @staticmethod
+    def _process_timestamp_ms() -> int:
+        """返回前端可直接消费的毫秒时间戳。"""
+
+        return int(_utc_now().timestamp() * 1000)
+
+    @classmethod
+    def _append_process_event(cls, process_run: dict[str, Any], event: dict[str, Any]) -> None:
+        """把 SSE 事件同步折叠为可持久化的运行过程步骤。"""
+
+        event_type = event.get("type")
+        if event_type == "status":
+            cls._append_process_status_event(process_run, event)
+            return
+        if event_type == "plan":
+            cls._upsert_process_step(
+                process_run,
+                step_id="replan",
+                label="判断下一步动作",
+                detail=f"推进决策：{event.get('action') or 'unknown'}"
+                + (f" · {event.get('reason')}" if event.get("reason") else ""),
+                status="completed",
+            )
+            return
+        if event_type == "content":
+            cls._upsert_process_step(
+                process_run,
+                step_id="llm",
+                label="生成下一题 / 结束语",
+                detail="面试官已生成下一步内容，正在保存本轮结果。",
+                status="completed",
+            )
+            return
+        if event_type == "step_complete":
+            response = event.get("response") if isinstance(event.get("response"), dict) else {}
+            cls._upsert_process_step(
+                process_run,
+                step_id="persist",
+                label="保存本轮结果",
+                detail=str(response.get("message") or "答案已提交，流程已推进"),
+                status="completed",
+            )
+            return
+        if event_type == "report":
+            cls._upsert_process_step(
+                process_run,
+                step_id="report",
+                label="生成统一评估报告",
+                detail="统一评估报告已更新。",
+                status="completed",
+            )
+            return
+        if event_type == "done":
+            cls._upsert_process_step(
+                process_run,
+                step_id="done",
+                label="本轮完成",
+                detail="当前轮流式流程已结束，可以继续作答或查看结果。",
+                status="completed",
+            )
+            process_run["status"] = "completed"
+            return
+        if event_type == "error":
+            cls._mark_process_failed(process_run, str(event.get("message") or "流式过程异常"))
+
+    @classmethod
+    def _append_process_status_event(cls, process_run: dict[str, Any], event: dict[str, Any]) -> None:
+        """把 status SSE 阶段映射为运行过程步骤。"""
+
+        stage = str(event.get("stage") or "")
+        label = str(event.get("label") or event.get("message") or "")
+        detail = str(event.get("detail") or event.get("message") or "")
+        if stage in {"session_loaded", "answer_observation_start"}:
+            cls._upsert_process_step(process_run, step_id="observation", label=label or "评估回答完整性", detail=detail, status="active")
+        elif stage == "answer_observation_complete":
+            cls._upsert_process_step(process_run, step_id="observation", label=label or "评估回答完整性", detail=detail, status="completed")
+        elif stage == "replan_start":
+            cls._upsert_process_step(process_run, step_id="replan", label=label or "判断下一步动作", detail=detail, status="active")
+        elif stage == "replan_complete":
+            cls._upsert_process_step(process_run, step_id="replan", label=label or "判断下一步动作", detail=detail, status="completed")
+        elif stage == "tool_prepare_start":
+            cls._upsert_process_step(process_run, step_id="tool_prepare", label=label or "准备工具上下文", detail=detail, status="active")
+        elif stage == "tool_call_complete":
+            cls._upsert_process_step(
+                process_run,
+                step_id="tool_prepare",
+                label="准备工具上下文",
+                detail="证据工具上下文准备完成。",
+                status="completed",
+            )
+            cls._upsert_process_step(
+                process_run,
+                step_id="tool_call",
+                label=label or "调用证据工具",
+                detail=detail,
+                status="completed",
+                tool_summary=deepcopy(event.get("tool")) if isinstance(event.get("tool"), dict) else None,
+            )
+        elif stage == "tool_skipped":
+            cls._upsert_process_step(process_run, step_id="tool_prepare", label=label or "本轮未调用证据工具", detail=detail, status="skipped")
+        elif stage == "llm_generation_start":
+            cls._upsert_process_step(process_run, step_id="llm", label=label or "生成下一题 / 结束语", detail=detail, status="active")
+        elif stage == "llm_generation_complete":
+            cls._upsert_process_step(process_run, step_id="llm", label=label or "生成下一题 / 结束语", detail=detail, status="completed")
+        elif stage == "persist_start":
+            cls._upsert_process_step(process_run, step_id="persist", label=label or "保存本轮结果", detail=detail, status="active")
+        elif stage == "persist_complete":
+            cls._upsert_process_step(process_run, step_id="persist", label=label or "保存本轮结果", detail=detail, status="completed")
+        elif stage == "report_start":
+            cls._upsert_process_step(process_run, step_id="report", label=label or "生成统一评估报告", detail=detail, status="active")
+        elif stage == "report_complete":
+            cls._upsert_process_step(process_run, step_id="report", label=label or "生成统一评估报告", detail=detail, status="completed")
+
+    @classmethod
+    def _upsert_process_step(
+        cls,
+        process_run: dict[str, Any],
+        *,
+        step_id: str,
+        label: str,
+        detail: str,
+        status: str,
+        tool_summary: dict[str, Any] | None = None,
+    ) -> None:
+        """插入或更新一个运行过程步骤。"""
+
+        steps = list(process_run.get("steps", []))
+        if status == "active":
+            for step in steps:
+                if step.get("status") == "active" and step.get("id") != step_id:
+                    step["status"] = "completed"
+        next_step = {
+            "id": step_id,
+            "label": label,
+            "detail": detail,
+            "status": status,
+            "timestamp": cls._process_timestamp_ms(),
+        }
+        if tool_summary:
+            next_step["tool_summary"] = deepcopy(tool_summary)
+
+        for index, step in enumerate(steps):
+            if step.get("id") == step_id:
+                next_step["timestamp"] = step.get("timestamp") or next_step["timestamp"]
+                if not next_step.get("detail") and step.get("detail"):
+                    next_step["detail"] = step["detail"]
+                if "tool_summary" not in next_step and step.get("tool_summary"):
+                    next_step["tool_summary"] = deepcopy(step["tool_summary"])
+                steps[index] = next_step
+                process_run["steps"] = steps
+                return
+
+        steps.append(next_step)
+        process_run["steps"] = steps
+
+    @classmethod
+    def _mark_process_failed(cls, process_run: dict[str, Any], message: str) -> None:
+        """把当前运行过程标记为失败。"""
+
+        steps = list(process_run.get("steps", []))
+        active_step = next((step for step in steps if step.get("status") == "active"), None)
+        failed_step_id = str((active_step or steps[-1] if steps else {}).get("id") or "submit")
+        cls._upsert_process_step(
+            process_run,
+            step_id=failed_step_id,
+            label=str((active_step or {}).get("label") or "提交答案"),
+            detail=message,
+            status="failed",
+        )
+        process_run["status"] = "failed"
+
+    @staticmethod
+    def _build_observation_stage_detail(observation: dict[str, Any]) -> str:
+        """把回答观察结果转成适合前端展示的阶段说明。"""
+
+        status = str(observation.get("main_question_status") or "partial")
+        confidence = observation.get("confidence")
+        missing_signals = [
+            str(item).strip()
+            for item in list(observation.get("missing_signals", []) or [])
+            if str(item).strip()
+        ]
+        parts = [f"完整性状态：{status}"]
+        if isinstance(confidence, (int, float)):
+            parts.append(f"置信度：{confidence:.0%}")
+        if missing_signals:
+            parts.append(f"仍需关注：{'、'.join(missing_signals[:2])}")
+        return "；".join(parts) + "。"
+
+    @staticmethod
+    def _build_tool_stage_detail(tool_context: dict[str, Any]) -> str:
+        """把工具上下文转成适合前端展示的阶段说明。"""
+
+        tool_name = str(tool_context.get("tool_name") or "").strip()
+        reason = str(tool_context.get("decision_reason") or tool_context.get("error_message") or "").strip()
+        if not tool_name:
+            return reason
+        if tool_context.get("success"):
+            return f"{tool_name} 已返回可用于追问的证据。"
+        if reason:
+            return f"{tool_name} 未调用或未命中：{reason}。"
+        return f"{tool_name} 本轮未产生可用证据。"
+
+    @staticmethod
+    def _build_tool_status_summary(tool_context: dict[str, Any]) -> dict[str, Any]:
+        """生成面向前端展示的工具调用摘要，避免暴露完整工具原始结果。"""
+
+        tool_name = str(tool_context.get("tool_name") or "").strip()
+        result = tool_context.get("result", {})
+        result_payload = result if isinstance(result, dict) else {}
+        if tool_name == "github_repo_evidence_tool":
+            repo_name = str(result_payload.get("repo_name") or result_payload.get("repo_url") or "GitHub 仓库").strip()
+            matched_files = [
+                str(item).strip()
+                for item in list(result_payload.get("matched_files", []) or [])
+                if str(item).strip()
+            ]
+            items = list(result_payload.get("items", []) or [])
+            if not matched_files:
+                matched_files = [
+                    str(item.get("source_path", "")).strip()
+                    for item in items
+                    if isinstance(item, dict) and str(item.get("source_path", "")).strip()
+                ]
+            file_summary = "、".join(matched_files[:3])
+            summary = f"从 {repo_name} 中获取了相关代码片段"
+            if file_summary:
+                summary += f"，命中文件：{file_summary}"
+            return {
+                "name": tool_name,
+                "display_name": "GitHub 仓库证据工具",
+                "source": repo_name,
+                "summary": summary + "。",
+                "matched_files": matched_files[:5],
+                "retrieval_reason": result_payload.get("retrieval_reason") or tool_context.get("decision_reason"),
+            }
+        if tool_name == "resume_evidence_tool":
+            matched_projects = [
+                str(item).strip()
+                for item in list(result_payload.get("matched_projects", []) or [])
+                if str(item).strip()
+            ]
+            matched_skills = [
+                str(item).strip()
+                for item in list(result_payload.get("matched_skills", []) or [])
+                if str(item).strip()
+            ]
+            source_parts = matched_projects[:2] or matched_skills[:3]
+            source = "、".join(source_parts) if source_parts else "简历内容"
+            return {
+                "name": tool_name,
+                "display_name": "简历证据工具",
+                "source": source,
+                "summary": f"从{source}中获取了与当前追问相关的项目/技能片段。",
+                "matched_projects": matched_projects[:5],
+                "matched_skills": matched_skills[:5],
+                "retrieval_reason": result_payload.get("retrieval_reason") or tool_context.get("decision_reason"),
+            }
+        return {
+            "name": tool_name,
+            "display_name": tool_name or "证据工具",
+            "source": "工具结果",
+            "summary": InterviewService._build_tool_stage_detail(tool_context),
+            "retrieval_reason": tool_context.get("decision_reason"),
+        }
 
     async def _load_session_bundle(
         self,
@@ -714,9 +1280,53 @@ class InterviewService:
         state["action_reason"] = interview_session.session_context_json.get("action_reason", state.get("action_reason"))
         state["completion_message"] = interview_session.session_context_json.get("completion_message", state.get("completion_message"))
         state["assistant_message"] = interview_session.session_context_json.get("assistant_message", state.get("assistant_message"))
+        state["interview_plan"] = deepcopy(
+            interview_session.session_context_json.get("interview_plan", state.get("interview_plan", {}))
+        )
+        state["plan_progress"] = deepcopy(
+            interview_session.session_context_json.get("plan_progress", state.get("plan_progress", {}))
+        )
+        state["current_main_question_key"] = interview_session.session_context_json.get(
+            "current_main_question_key",
+            interview_session.session_context_json.get(
+                "current_topic_key",
+                state.get("current_main_question_key"),
+            ),
+        )
+        state["remaining_main_question_keys"] = list(
+            interview_session.session_context_json.get(
+                "remaining_main_question_keys",
+                interview_session.session_context_json.get(
+                    "remaining_topics",
+                    state.get("remaining_main_question_keys", []),
+                ),
+            )
+        )
+        state["coverage_status"] = deepcopy(
+            interview_session.session_context_json.get("coverage_status", state.get("coverage_status", {}))
+        )
+        state["answer_observations"] = deepcopy(
+            interview_session.session_context_json.get(
+                "answer_observations",
+                state.get("answer_observations", []),
+            )
+        )
+        state["termination_decision_context"] = deepcopy(
+            interview_session.session_context_json.get(
+                "termination_decision_context",
+                state.get("termination_decision_context", {}),
+            )
+        )
+        state["latest_tool_context"] = deepcopy(
+            interview_session.session_context_json.get(
+                "latest_tool_context",
+                state.get("latest_tool_context", {}),
+            )
+        )
         state["answer_count"] = len(answers)
         state["completed"] = interview_session.status == InterviewSessionStatus.COMPLETED.value
         state["report_summary"] = deepcopy(report.report_json if report else state.get("report_summary", {}))
+        hydrate_plan_state(state, max_follow_up_questions=config.interview.max_follow_up_questions)
         return state
 
     def _apply_state_to_session(
@@ -735,6 +1345,8 @@ class InterviewService:
             "last_action": state.get("next_action"),
             "resume_markdown": state.get("resume_markdown", ""),
             "resume_metadata": deepcopy(state.get("resume_metadata", {})),
+            "interview_plan": deepcopy(state.get("interview_plan", {})),
+            "plan_progress": deepcopy(state.get("plan_progress", {})),
         }
         if state.get("completed"):
             interview_session.status = InterviewSessionStatus.COMPLETED.value
@@ -748,6 +1360,8 @@ class InterviewService:
         reference_markdown: str,
         reference_files: list[str],
         *,
+        planning_snapshot_markdown: str,
+        planning_snapshot_sources: list[dict[str, Any]],
         resume_markdown: str,
         resume_metadata: dict[str, Any],
     ) -> dict[str, Any]:
@@ -762,6 +1376,8 @@ class InterviewService:
             ],
             "reference_markdown": reference_markdown,
             "reference_files": reference_files,
+            "planning_snapshot_markdown": planning_snapshot_markdown,
+            "planning_snapshot_sources": deepcopy(planning_snapshot_sources),
             "resume_markdown": resume_markdown,
             "resume_metadata": deepcopy(resume_metadata),
         }
@@ -772,6 +1388,8 @@ class InterviewService:
         reference_markdown: str,
         reference_files: list[str],
         *,
+        planning_snapshot_markdown: str,
+        planning_snapshot_sources: list[dict[str, Any]],
         resume_markdown: str,
         resume_metadata: dict[str, Any],
     ) -> InterviewSkillContext:
@@ -783,6 +1401,8 @@ class InterviewService:
             "description": skill_detail.description,
             "content_markdown": skill_detail.content_markdown,
             "reference_markdown": reference_markdown,
+            "planning_snapshot_markdown": planning_snapshot_markdown,
+            "planning_snapshot_sources": deepcopy(planning_snapshot_sources),
             "categories": [
                 category.model_dump(mode="json") for category in skill_detail.categories
             ],
@@ -804,11 +1424,94 @@ class InterviewService:
             "description": str(metadata.get("skill_description", "")),
             "content_markdown": str(metadata.get("skill_markdown", "")),
             "reference_markdown": str(metadata.get("reference_markdown", "")),
+            "planning_snapshot_markdown": str(metadata.get("planning_snapshot_markdown", "")),
+            "planning_snapshot_sources": list(metadata.get("planning_snapshot_sources", [])),
             "categories": list(metadata.get("skill_categories", [])),
             "reference_files": list(metadata.get("reference_files", [])),
             "resume_markdown": str(metadata.get("resume_markdown", "")),
             "resume_metadata": deepcopy(metadata.get("resume_metadata", {})),
         }
+
+    def _build_planning_snapshot(
+        self,
+        skill_detail: Any,
+        reference_markdown: str,
+        reference_files: list[str],
+        *,
+        resume_markdown: str,
+        resume_metadata: dict[str, Any],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """组装 planner 使用的冻结快照与来源清单。"""
+
+        planning_snapshot_sources: list[dict[str, Any]] = [
+            {
+                "source_type": "skill_markdown",
+                "name": "SKILL.md",
+                "skill_id": skill_detail.skill_id,
+                "display_name": skill_detail.display_name,
+            },
+            {
+                "source_type": "reference_files",
+                "name": "reference_files",
+                "files": list(reference_files),
+                "count": len(reference_files),
+            },
+        ]
+        if resume_markdown.strip():
+            planning_snapshot_sources.append(
+                {
+                    "source_type": "resume_markdown",
+                    "name": "resume",
+                    "has_resume": True,
+                    "resume_metadata": deepcopy(resume_metadata),
+                }
+            )
+
+        sections = [
+            "# Planning Snapshot",
+            "## Source Manifest",
+        ]
+        for item in planning_snapshot_sources:
+            parts = [f"- {item.get('source_type', 'source')}"]
+            name = str(item.get("name", "")).strip()
+            if name:
+                parts.append(f": {name}")
+            if item.get("skill_id"):
+                parts.append(f" ({item['skill_id']})")
+            if item.get("files"):
+                parts.append(f" -> {', '.join(str(value) for value in item['files'])}")
+            sections.append("".join(parts))
+
+        sections.extend(
+            [
+                "",
+                "## Skill Persona",
+                skill_detail.content_markdown.strip(),
+                "",
+                "## Reference Material",
+                reference_markdown.strip(),
+            ]
+        )
+        if resume_markdown.strip():
+            sections.extend(
+                [
+                    "",
+                    "## Resume Context",
+                    resume_markdown.strip(),
+                ]
+            )
+        if resume_metadata:
+            sections.extend(
+                [
+                    "",
+                    "## Resume Metadata",
+                    "```json",
+                    json.dumps(resume_metadata, ensure_ascii=False, indent=2, sort_keys=True),
+                    "```",
+                ]
+            )
+
+        return "\n".join(section for section in sections if section is not None).strip(), planning_snapshot_sources
 
     def _build_session_dto(
         self,

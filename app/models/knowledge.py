@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Index, JSON, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, JSON, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -78,6 +78,13 @@ class KnowledgeBaseEntity(Base):
         default=KnowledgeBaseStatus.ACTIVE.value,
         index=True,
     )
+    is_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("true"),
+        index=True,
+    )
     vector_collection_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
@@ -124,6 +131,13 @@ class KnowledgeDocumentEntity(Base):
         String(32),
         nullable=False,
         default=KnowledgeDocumentIndexStatus.UPLOADED.value,
+        index=True,
+    )
+    is_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("true"),
         index=True,
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

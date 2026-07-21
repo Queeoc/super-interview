@@ -170,10 +170,13 @@ class LLMFactory:
                 details={"provider_code": runtime_provider.provider_code},
             )
 
-        extra_body = dict(runtime_provider.settings_json.get("extra_body", {}))
-        if extra_settings:
-            extra_body.update(extra_settings.get("extra_body", {}))
-        extra_body["stream"] = streaming
+        extra_body = self._resolve_extra_body(
+            runtime_provider=runtime_provider,
+            resolved_model=resolved_model,
+            resolved_base_url=resolved_base_url,
+            streaming=streaming,
+            extra_settings=extra_settings,
+        )
 
         request_timeout = runtime_provider.settings_json.get(
             "request_timeout_seconds",
@@ -194,6 +197,65 @@ class LLMFactory:
             timeout=request_timeout,
             extra_body=extra_body if extra_body else None,
         )
+
+    def _resolve_extra_body(
+        self,
+        *,
+        runtime_provider: ProviderRuntimeRecord,
+        resolved_model: str | None,
+        resolved_base_url: str | None,
+        streaming: bool,
+        extra_settings: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """组装 provider 额外参数，并修正已知的不兼容组合。"""
+
+        extra_body = dict(runtime_provider.settings_json.get("extra_body", {}))
+        if extra_settings:
+            extra_body.update(extra_settings.get("extra_body", {}))
+        extra_body["stream"] = streaming
+
+        # DashScope/Qwen 在非流式请求下要求显式关闭 thinking。
+        if self._should_force_disable_thinking(
+            runtime_provider=runtime_provider,
+            resolved_model=resolved_model,
+            resolved_base_url=resolved_base_url,
+            streaming=streaming,
+            extra_body=extra_body,
+        ):
+            previous_value = extra_body.get("enable_thinking")
+            extra_body["enable_thinking"] = False
+            if previous_value is not False:
+                logger.info(
+                    "检测到非流式 Qwen/DashScope 调用，自动关闭 thinking: provider_code={}, model={}",
+                    runtime_provider.provider_code,
+                    resolved_model,
+                )
+
+        return extra_body
+
+    @staticmethod
+    def _should_force_disable_thinking(
+        *,
+        runtime_provider: ProviderRuntimeRecord,
+        resolved_model: str | None,
+        resolved_base_url: str | None,
+        streaming: bool,
+        extra_body: dict[str, Any],
+    ) -> bool:
+        """判断当前请求是否需要强制关闭 thinking。"""
+
+        if streaming:
+            return False
+
+        provider_code = runtime_provider.provider_code.lower()
+        model_name = (resolved_model or "").lower()
+        api_base = (resolved_base_url or "").lower()
+        has_thinking_flag = "enable_thinking" in extra_body
+        is_dashscope_qwen = (
+            "dashscope.aliyuncs.com" in api_base
+            and ("qwen" in provider_code or "qwen" in model_name)
+        )
+        return has_thinking_flag or is_dashscope_qwen
 
     async def _invoke_with_failover(
         self,

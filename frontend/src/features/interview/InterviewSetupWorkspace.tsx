@@ -1,12 +1,40 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-import { FeedbackState, SectionCard } from '../../components/ui';
+import { FeedbackState, ProcessTimeline, type ProcessTimelineStep, SectionCard } from '../../components/ui';
 import { formatDateTime } from '../../utils/format';
 import { useResumeList } from '../resume/useResume';
 import { useSkillsList } from '../skills/useSkills';
 import styles from './InterviewSetupWorkspace.module.css';
 import { useCreateInterviewSession, useInterviewSessionsList } from './useInterview';
+
+const CREATE_INTERVIEW_STEPS: ProcessTimelineStep[] = [
+  {
+    id: 'config',
+    label: '读取面试配置',
+    description: '确认 Skill、语言、轮次和简历关联方式。'
+  },
+  {
+    id: 'context',
+    label: '加载 Skill / 简历上下文',
+    description: '整理出题需要的能力要求、参考资料和简历线索。'
+  },
+  {
+    id: 'planning',
+    label: '规划首轮问题',
+    description: '根据面试方向生成第一轮问题计划。'
+  },
+  {
+    id: 'first-question',
+    label: '生成面试官开场与首题',
+    description: '面试官正在把计划转成可回答的问题。'
+  },
+  {
+    id: 'enter-session',
+    label: '进入面试会话',
+    description: '保存会话并跳转到答题工作台。'
+  }
+];
 
 export function InterviewSetupWorkspace() {
   const navigate = useNavigate();
@@ -26,8 +54,40 @@ export function InterviewSetupWorkspace() {
   const [language, setLanguage] = useState('zh-CN');
   const [maxRounds, setMaxRounds] = useState(5);
   const [validationMessage, setValidationMessage] = useState('');
+  const [creationStartedAt, setCreationStartedAt] = useState<number | null>(null);
+  const [creationStepIndex, setCreationStepIndex] = useState(0);
+  const [createdSessionId, setCreatedSessionId] = useState<string | null>(null);
 
   const resolvedSkillId = skillId || defaultSkillId;
+  const isCreatingSession = creationStartedAt !== null || createSessionMutation.isPending;
+  const displayedCreationStepIndex = creationStartedAt !== null ? creationStepIndex : 3;
+  const creationCompletedStepIds = CREATE_INTERVIEW_STEPS
+    .slice(0, Math.min(displayedCreationStepIndex, CREATE_INTERVIEW_STEPS.length))
+    .map((step) => step.id);
+  const creationCurrentStepId = CREATE_INTERVIEW_STEPS[Math.min(displayedCreationStepIndex, CREATE_INTERVIEW_STEPS.length - 1)]?.id;
+
+  useEffect(() => {
+    if (!creationStartedAt || creationStepIndex >= 3) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setCreationStepIndex((current) => Math.min(current + 1, 3));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [creationStartedAt, creationStepIndex]);
+
+  useEffect(() => {
+    if (!createdSessionId || creationStepIndex < 3) {
+      return;
+    }
+
+    setCreationStepIndex(4);
+    const timer = window.setTimeout(() => {
+      navigate(`/interview/${createdSessionId}`);
+    }, 650);
+    return () => window.clearTimeout(timer);
+  }, [createdSessionId, creationStepIndex, navigate]);
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -38,6 +98,9 @@ export function InterviewSetupWorkspace() {
       return;
     }
 
+    setCreationStartedAt(Date.now());
+    setCreationStepIndex(0);
+    setCreatedSessionId(null);
     try {
       const session = await createSessionMutation.mutateAsync({
         skill_id: resolvedSkillId,
@@ -46,8 +109,11 @@ export function InterviewSetupWorkspace() {
         language,
         max_rounds: maxRounds
       });
-      navigate(`/interview/${session.session_id}`);
+      setCreatedSessionId(session.session_id);
     } catch (error) {
+      setCreationStartedAt(null);
+      setCreationStepIndex(0);
+      setCreatedSessionId(null);
       setValidationMessage(error instanceof Error ? error.message : '创建面试失败，请稍后重试。');
     }
   }
@@ -142,9 +208,20 @@ export function InterviewSetupWorkspace() {
               <FeedbackState tone="error" title="无法创建会话" message={validationMessage} />
             ) : null}
 
+            {isCreatingSession ? (
+              <ProcessTimeline
+                title="创建面试准备中"
+                description="正在生成首题，模型需要结合 Skill、简历和参考资料做一次完整规划。"
+                steps={CREATE_INTERVIEW_STEPS}
+                currentStepId={creationCurrentStepId}
+                completedStepIds={creationCompletedStepIds}
+                elapsedFrom={creationStartedAt ?? createSessionMutation.submittedAt ?? Date.now()}
+              />
+            ) : null}
+
             <div className={styles.actions}>
-              <button className={styles.primaryButton} disabled={createSessionMutation.isPending} type="submit">
-                {createSessionMutation.isPending ? '正在创建...' : '开始面试'}
+              <button className={styles.primaryButton} disabled={isCreatingSession} type="submit">
+                {isCreatingSession ? getCreationButtonLabel(creationCurrentStepId) : '开始面试'}
               </button>
             </div>
           </form>
@@ -176,7 +253,9 @@ export function InterviewSetupWorkspace() {
               >
                 <div className={styles.historyHeader}>
                   <strong>{session.title || `${session.skill_display_name} 模拟面试`}</strong>
-                  <span className={styles.historyStatus}>{session.completed ? '已完成' : '进行中'}</span>
+                  <span className={styles.historyStatus}>
+                    {resolveHistoryStatusLabel(session.completed, session.report_status)}
+                  </span>
                 </div>
                 <div className={styles.historyMeta}>
                   <span>Skill：{session.skill_display_name}</span>
@@ -198,4 +277,22 @@ export function InterviewSetupWorkspace() {
       </SectionCard>
     </div>
   );
+}
+
+function resolveHistoryStatusLabel(completed: boolean, reportStatus: string | null) {
+  if (completed && reportStatus === 'processing') {
+    return '报告生成中';
+  }
+
+  return completed ? '已完成' : '进行中';
+}
+
+function getCreationButtonLabel(currentStepId: string | undefined) {
+  if (currentStepId === 'enter-session') {
+    return '进入面试中...';
+  }
+  if (currentStepId === 'first-question') {
+    return '生成首题中...';
+  }
+  return '准备面试中...';
 }

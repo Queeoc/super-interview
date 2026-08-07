@@ -398,11 +398,16 @@ class InterviewExecutor:
         answer_text = str(state.get("latest_answer_text", ""))
         skill_id = str((state.get("skill") or {}).get("skill_id", "") or "").strip()
         follow_up_count = int(state.get("follow_up_count", 0) or 0)
-        if not resume_markdown.strip():
+        category_key = self._resolve_follow_up_category_key(current_question=current_question, blueprint=blueprint)
+        available_tools = self._build_available_follow_up_tools(
+            category_key=category_key,
+            resume_markdown=resume_markdown,
+        )
+        if not available_tools:
             return {
                 "tool_name": None,
                 "tool_source": "local_tool",
-                "decision_reason": "resume_missing",
+                "decision_reason": "no_available_tool_for_category",
                 "arguments": {},
                 "success": False,
                 "result": {},
@@ -418,9 +423,11 @@ class InterviewExecutor:
             resume_markdown=resume_markdown,
             resume_metadata=resume_metadata,
             skill_id=skill_id,
+            available_tools=available_tools,
         )
         should_prioritize_github = (
             follow_up_count == 0
+            and "github_repo_evidence_tool" in available_tools
             and self._has_github_repo_link(resume_markdown)
             and self._should_prefer_github_tool(
                 question_text=str(current_question.get("question_text", "")),
@@ -455,11 +462,7 @@ class InterviewExecutor:
                 original_tool_name,
             )
 
-        supported_tools = {
-            "resume_evidence_tool",
-            "github_repo_evidence_tool",
-            "knowledge_evidence_tool",
-        }
+        supported_tools = set(available_tools)
         if decision.should_call_tool and decision.tool_name in supported_tools:
             decision = decision.model_copy(
                 update={
@@ -502,6 +505,8 @@ class InterviewExecutor:
             skill_id=skill_id,
         )
         if decision.tool_name != "github_repo_evidence_tool" or tool_context.get("success"):
+            return tool_context
+        if "resume_evidence_tool" not in available_tools:
             return tool_context
 
         fallback_arguments = self._build_resume_evidence_tool_arguments(
@@ -548,10 +553,18 @@ class InterviewExecutor:
         resume_markdown: str,
         resume_metadata: dict[str, Any],
         skill_id: str,
+        available_tools: list[str],
     ) -> _ToolDecisionOutput:
         """Decide whether the follow-up stage should call a local evidence tool."""
 
         github_context_available = self._has_github_repo_link(resume_markdown)
+        available_tool_guidance = self._build_available_tool_guidance(
+            available_tools=available_tools,
+            category_key=self._resolve_follow_up_category_key(
+                current_question=current_question,
+                blueprint=blueprint,
+            ),
+        )
         variables = {
             "current_question": self._prompt_runner.wrap_untrusted_text(
                 "current_question",
@@ -588,6 +601,14 @@ class InterviewExecutor:
                 "github_context_available",
                 "yes" if github_context_available else "no",
             ),
+            "available_tools": self._prompt_runner.wrap_untrusted_text(
+                "available_tools",
+                "\n".join(f"- {tool_name}" for tool_name in available_tools) or "- none",
+            ),
+            "available_tool_guidance": self._prompt_runner.wrap_untrusted_text(
+                "available_tool_guidance",
+                available_tool_guidance,
+            ),
         }
         try:
             decision = await self._prompt_runner.ainvoke_structured(
@@ -606,6 +627,13 @@ class InterviewExecutor:
                     tool_name=decision.tool_name,
                     arguments={},
                     reason="unsupported_tool",
+                )
+            if decision.tool_name and decision.tool_name not in set(available_tools):
+                return _ToolDecisionOutput(
+                    should_call_tool=False,
+                    tool_name=decision.tool_name,
+                    arguments={},
+                    reason="tool_not_available_for_category",
                 )
             if decision.tool_name == "github_repo_evidence_tool" and not github_context_available:
                 return _ToolDecisionOutput(
@@ -635,6 +663,7 @@ class InterviewExecutor:
                 answer_text=answer_text,
                 resume_markdown=resume_markdown,
                 skill_id=skill_id,
+                available_tools=available_tools,
             )
 
     def _fallback_tool_decision(
@@ -647,17 +676,19 @@ class InterviewExecutor:
         answer_text: str,
         resume_markdown: str,
         skill_id: str,
+        available_tools: list[str],
     ) -> _ToolDecisionOutput:
         """Use stable rules when LLM tool decision falls back."""
 
         missing_signals = [str(item).strip() for item in coverage.get("missing_signals", []) if str(item).strip()]
         answer_too_short = len(answer_text.strip()) < 80
-        should_call_tool = bool(missing_signals) or answer_too_short
+        should_call_tool = bool(available_tools) and (bool(missing_signals) or answer_too_short)
         tool_name: str | None = None
         github_search_keywords = self._extract_observation_search_keywords(observation)
         if should_call_tool:
             if (
-                github_search_keywords
+                "github_repo_evidence_tool" in available_tools
+                and github_search_keywords
                 and self._has_github_repo_link(resume_markdown)
                 and self._should_prefer_github_tool(
                     question_text=str(current_question.get("question_text", "")),
@@ -667,15 +698,22 @@ class InterviewExecutor:
                 )
             ):
                 tool_name = "github_repo_evidence_tool"
-            elif self._should_prefer_knowledge_tool(
-                question_text=str(current_question.get("question_text", "")),
-                question_intent=str(blueprint.get("intent", "")),
-                focus_topics=[str(item).strip() for item in blueprint.get("follow_up_focus", []) if str(item).strip()],
-                missing_signals=missing_signals,
-                answer_text=answer_text,
+            elif "knowledge_evidence_tool" in available_tools and (
+                len(available_tools) == 1
+                or self._should_prefer_knowledge_tool(
+                    question_text=str(current_question.get("question_text", "")),
+                    question_intent=str(blueprint.get("intent", "")),
+                    focus_topics=[
+                        str(item).strip()
+                        for item in blueprint.get("follow_up_focus", [])
+                        if str(item).strip()
+                    ],
+                    missing_signals=missing_signals,
+                    answer_text=answer_text,
+                )
             ):
                 tool_name = "knowledge_evidence_tool"
-            else:
+            elif "resume_evidence_tool" in available_tools:
                 tool_name = "resume_evidence_tool"
         logger.info(
             "follow-up tool fallback decision tool_name={}, should_call_tool={}, missing_signals={}, answer_too_short={}, github_context_available={}",
@@ -719,6 +757,58 @@ class InterviewExecutor:
             ),
             reason="fallback_rule_based_decision" if should_call_tool else "fallback_skip",
         )
+
+    def _resolve_follow_up_category_key(
+        self,
+        *,
+        current_question: dict[str, Any],
+        blueprint: dict[str, Any],
+    ) -> str:
+        """Resolve the current follow-up category used by tool availability policy."""
+
+        raw_category_key = str(
+            current_question.get("category_key")
+            or blueprint.get("category_key")
+            or "GENERAL"
+        )
+        return raw_category_key.strip().upper() or "GENERAL"
+
+    def _build_available_follow_up_tools(self, *, category_key: str, resume_markdown: str) -> list[str]:
+        """Build the tool list exposed to the follow-up tool-decision prompt."""
+
+        normalized_category_key = category_key.strip().upper() or "GENERAL"
+        if normalized_category_key == "PROJECT":
+            tools: list[str] = []
+            if resume_markdown.strip():
+                tools.append("resume_evidence_tool")
+            if self._has_github_repo_link(resume_markdown):
+                tools.append("github_repo_evidence_tool")
+            return tools
+        return ["knowledge_evidence_tool"]
+
+    def _build_available_tool_guidance(self, *, available_tools: list[str], category_key: str) -> str:
+        """Render concise tool guidance for the current category policy."""
+
+        if not available_tools:
+            return "当前 category 没有可用证据工具；如果需要证据，也必须返回 should_call_tool=false。"
+
+        guidance: list[str] = [
+            f"当前 category_key 为 `{category_key}`。",
+            "只能选择 Available tools 中列出的工具；不要选择未列出的工具。",
+        ]
+        if "github_repo_evidence_tool" in available_tools:
+            guidance.append(
+                "`github_repo_evidence_tool` 只用于 PROJECT 分类下的真实仓库代码或 README 证据。"
+            )
+        if "resume_evidence_tool" in available_tools:
+            guidance.append(
+                "`resume_evidence_tool` 用于 PROJECT 分类下的真实项目、职责、权衡或结果证据。"
+            )
+        if "knowledge_evidence_tool" in available_tools:
+            guidance.append(
+                "`knowledge_evidence_tool` 用于技术机制、生产场景、边界条件、实现方法和常见坑。"
+            )
+        return "\n".join(f"- {item}" for item in guidance)
 
     async def _invoke_interview_tool(
         self,

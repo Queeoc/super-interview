@@ -289,6 +289,33 @@ class _ReplanAliasSchema(BaseModel):
     plan_adjustment: str | None = None
 
 
+def test_executor_builds_available_follow_up_tools_by_category() -> None:
+    """追问阶段应先按 category_key 生成可暴露给 LLM 的工具列表。"""
+
+    executor = InterviewExecutor(InterviewPromptRunner(enable_llm=False))
+
+    assert executor._build_available_follow_up_tools(  # type: ignore[attr-defined]
+        category_key="PROJECT",
+        resume_markdown="# 项目经历\n- 负责缓存平台。",
+    ) == ["resume_evidence_tool"]
+    assert executor._build_available_follow_up_tools(  # type: ignore[attr-defined]
+        category_key="PROJECT",
+        resume_markdown="# 项目经历\n- GitHub: https://github.com/acme/cache-platform",
+    ) == ["resume_evidence_tool", "github_repo_evidence_tool"]
+    assert executor._build_available_follow_up_tools(  # type: ignore[attr-defined]
+        category_key="SYSTEM_DESIGN_SCENARIO",
+        resume_markdown="# 项目经历\n- GitHub: https://github.com/acme/cache-platform",
+    ) == ["knowledge_evidence_tool"]
+    assert executor._build_available_follow_up_tools(  # type: ignore[attr-defined]
+        category_key="JAVA",
+        resume_markdown="# 项目经历\n- GitHub: https://github.com/acme/cache-platform",
+    ) == ["knowledge_evidence_tool"]
+    assert executor._build_available_follow_up_tools(  # type: ignore[attr-defined]
+        category_key="UNKNOWN",
+        resume_markdown="",
+    ) == ["knowledge_evidence_tool"]
+
+
 def test_interview_default_max_follow_up_questions_is_five(monkeypatch: pytest.MonkeyPatch) -> None:
     """默认每个主问题最多允许 5 个追问。"""
 
@@ -915,8 +942,8 @@ async def test_executor_injects_resume_evidence_context_when_tool_called() -> No
                     should_call_tool=True,
                     tool_name="resume_evidence_tool",
                     arguments={
-                        "category_key": "CACHE",
-                        "question_text": "请介绍你的缓存设计经验。",
+                        "category_key": "PROJECT",
+                        "question_text": "请结合你的真实项目说明缓存设计经验。",
                         "answer_text": "我做过 Redis 优化。",
                         "focus_topics": ["redis", "失效策略"],
                         "missing_signals": ["结果"],
@@ -950,8 +977,8 @@ async def test_executor_injects_resume_evidence_context_when_tool_called() -> No
             {
                 "question_key": "q-1",
                 "round_index": 1,
-                "category_key": "CACHE",
-                "question_text": "请介绍你的缓存设计经验。",
+                "category_key": "PROJECT",
+                "question_text": "请结合你的真实项目说明缓存设计经验。",
                 "parent_question_key": None,
                 "source": "planned",
                 "status": "asked",
@@ -2182,6 +2209,210 @@ async def test_executor_injects_github_evidence_context_when_github_tool_selecte
     assert next_state["latest_tool_context"]["success"] is True
     assert next_state["latest_tool_context"]["arguments"]["search_keywords"] == ["asyncio", "CustomAgent"]
     assert next_state["latest_tool_context"]["arguments"]["keywords"] == ["asyncio", "CustomAgent"]
+
+
+@pytest.mark.asyncio
+async def test_executor_tool_decision_receives_project_available_tools() -> None:
+    """PROJECT 追问应把简历和 GitHub 工具作为可用工具传入 tool decision。"""
+
+    captured: dict[str, Any] = {}
+
+    class _RecordingPromptRunner:
+        @staticmethod
+        def wrap_untrusted_text(tag_name: str, content: str) -> str:
+            return content
+
+        async def ainvoke_structured(
+            self,
+            *,
+            template_name: str,
+            schema: type[BaseModel],
+            variables: dict[str, Any],
+            model: str | None = None,
+            temperature: float = 0.2,
+        ) -> Any:
+            if template_name == "tool_decision.st":
+                captured["available_tools"] = variables["available_tools"]
+                captured["available_tool_guidance"] = variables["available_tool_guidance"]
+                return schema(
+                    should_call_tool=False,
+                    tool_name=None,
+                    arguments={},
+                    reason="直接追问即可",
+                )
+            return schema(question_text="请继续说明这个项目中的真实实现细节。")
+
+    executor = InterviewExecutor(_RecordingPromptRunner())  # type: ignore[arg-type]
+    state = {
+        "session_id": "session-project-tools",
+        "skill": {
+            "skill_id": "java-backend",
+            "display_name": "Java Backend",
+            "description": "desc",
+            "content_markdown": "skill",
+            "reference_markdown": "ref",
+            "categories": [],
+            "reference_files": [],
+        },
+        "resume_markdown": (
+            "# 项目经历\n"
+            "## 面试知识库项目\n"
+            "- GitHub: https://github.com/Snailclimb/interview-guide\n"
+        ),
+        "resume_metadata": {},
+        "questions": [
+            {
+                "question_key": "q-1",
+                "round_index": 1,
+                "category_key": "PROJECT",
+                "question_text": "请结合真实项目说明你的实现经验。",
+                "parent_question_key": None,
+                "source": "planned",
+                "status": "asked",
+                "is_follow_up": False,
+                "asked_at": None,
+                "answered_at": None,
+            }
+        ],
+        "coverage_status": {
+            "q-1": {
+                "main_question_key": "q-1",
+                "question_key": "q-1",
+                "required": True,
+                "status": "partial",
+                "confidence": 0.3,
+                "observed_signals": ["项目背景"],
+                "missing_signals": ["实现细节"],
+                "follow_up_count": 0,
+                "evidence_count": 0,
+                "completed": False,
+                "last_updated": None,
+            }
+        },
+        "current_question_key": "q-1",
+        "current_round": 1,
+        "follow_up_count": 0,
+        "latest_answer_text": "我参与过这个项目。",
+        "next_action": "follow_up",
+    }
+
+    next_state = await executor.run(state)  # type: ignore[arg-type]
+
+    assert "resume_evidence_tool" in captured["available_tools"]
+    assert "github_repo_evidence_tool" in captured["available_tools"]
+    assert "knowledge_evidence_tool" not in captured["available_tools"]
+    assert "PROJECT" in captured["available_tool_guidance"]
+    assert next_state["latest_tool_context"]["tool_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_executor_blocks_github_when_not_available_for_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非 PROJECT 分类即使模型返回 GitHub 工具，也不应执行越权工具。"""
+
+    executor_module = importlib.import_module("app.agent.interview.executor")
+    captured: dict[str, Any] = {"github_called": False}
+
+    async def _fake_github_tool(**kwargs: Any) -> Any:
+        captured["github_called"] = True
+        raise AssertionError("github tool must not be called for non-PROJECT categories")
+
+    monkeypatch.setattr(executor_module, "github_repo_evidence_tool", _fake_github_tool)
+
+    class _RecordingPromptRunner:
+        @staticmethod
+        def wrap_untrusted_text(tag_name: str, content: str) -> str:
+            return content
+
+        async def ainvoke_structured(
+            self,
+            *,
+            template_name: str,
+            schema: type[BaseModel],
+            variables: dict[str, Any],
+            model: str | None = None,
+            temperature: float = 0.2,
+        ) -> Any:
+            if template_name == "tool_decision.st":
+                captured["available_tools"] = variables["available_tools"]
+                return schema(
+                    should_call_tool=True,
+                    tool_name="github_repo_evidence_tool",
+                    arguments={
+                        "category_key": "SYSTEM_DESIGN_SCENARIO",
+                        "question_text": "如何处理库存扣减一致性？",
+                        "answer_text": "我会设计库存扣减流程。",
+                        "search_keywords": ["InventoryService", "Redis Stream"],
+                        "focus_topics": ["库存扣减"],
+                        "missing_signals": ["失败回滚"],
+                        "top_k": 2,
+                    },
+                    reason="模型误选 GitHub",
+                )
+            return schema(question_text="请具体说明库存预扣、最终扣减和失败回滚流程。")
+
+    executor = InterviewExecutor(_RecordingPromptRunner())  # type: ignore[arg-type]
+    state = {
+        "session_id": "session-block-github",
+        "skill": {
+            "skill_id": "java-backend",
+            "display_name": "Java Backend",
+            "description": "desc",
+            "content_markdown": "skill",
+            "reference_markdown": "ref",
+            "categories": [],
+            "reference_files": [],
+        },
+        "resume_markdown": (
+            "# 项目经历\n"
+            "## 秒杀项目\n"
+            "- GitHub: https://github.com/Snailclimb/interview-guide\n"
+        ),
+        "resume_metadata": {},
+        "questions": [
+            {
+                "question_key": "q-1",
+                "round_index": 1,
+                "category_key": "SYSTEM_DESIGN_SCENARIO",
+                "question_text": "在秒杀场景中，你会如何处理库存扣减一致性？",
+                "parent_question_key": None,
+                "source": "planned",
+                "status": "asked",
+                "is_follow_up": False,
+                "asked_at": None,
+                "answered_at": None,
+            }
+        ],
+        "coverage_status": {
+            "q-1": {
+                "main_question_key": "q-1",
+                "question_key": "q-1",
+                "required": True,
+                "status": "partial",
+                "confidence": 0.2,
+                "observed_signals": [],
+                "missing_signals": ["失败回滚"],
+                "follow_up_count": 0,
+                "evidence_count": 0,
+                "completed": False,
+                "last_updated": None,
+            }
+        },
+        "current_question_key": "q-1",
+        "current_round": 1,
+        "follow_up_count": 0,
+        "latest_answer_text": "我会设计库存扣减流程。",
+        "next_action": "follow_up",
+    }
+
+    next_state = await executor.run(state)  # type: ignore[arg-type]
+
+    assert captured["available_tools"].strip() == "- knowledge_evidence_tool"
+    assert captured["github_called"] is False
+    assert next_state["latest_tool_context"]["tool_name"] == "github_repo_evidence_tool"
+    assert next_state["latest_tool_context"]["decision_reason"] == "tool_not_available_for_category"
+    assert next_state["latest_tool_context"]["success"] is False
 
 
 @pytest.mark.asyncio
